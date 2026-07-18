@@ -35,6 +35,10 @@ WELCOME_CHANNEL_ID = os.getenv("WELCOME_CHANNEL_ID")
 COUNTING_CHANNEL_ID = os.getenv("COUNTING_CHANNEL_ID")
 CLIPS_CHANNEL_ID = os.getenv("CLIPS_CHANNEL_ID")
 SUGGESTIONS_CHANNEL_ID = os.getenv("SUGGESTIONS_CHANNEL_ID")
+VERIFY_CHANNEL_ID = os.getenv("VERIFY_CHANNEL_ID")
+VERIFIED_ROLE_ID = os.getenv("VERIFIED_ROLE_ID")
+VERIFY_CODE_EXPIRY_SECONDS = int(os.getenv("VERIFY_CODE_EXPIRY_SECONDS", "600"))
+VERIFY_CLEANUP_INTERVAL_SECONDS = int(os.getenv("VERIFY_CLEANUP_INTERVAL_SECONDS", "300"))
 ECONOMY_DB_PATH = os.getenv("ECONOMY_DB_PATH", "economy.db")
 ECONOMY_STARTING_BALANCE = int(
     os.getenv("ECONOMY_STARTING_BALANCE", "500")
@@ -887,6 +891,240 @@ async def send_quote_result(
 
 
 # =========================================================
+# VERIFICATION SYSTEM
+# =========================================================
+
+VERIFY_EMBED_FOOTER = "777 • Verification Portal"
+verification_codes: dict[tuple[int, int], dict[str, int | str]] = {}
+verification_cleanup_task: asyncio.Task | None = None
+verification_lock = asyncio.Lock()
+
+
+def configured_verify_channel_id() -> int | None:
+    if not VERIFY_CHANNEL_ID:
+        return None
+
+    try:
+        return int(VERIFY_CHANNEL_ID)
+    except ValueError:
+        logger.warning("VERIFY_CHANNEL_ID must contain only numbers.")
+        return None
+
+
+def configured_verified_role_id() -> int | None:
+    if not VERIFIED_ROLE_ID:
+        return None
+
+    try:
+        return int(VERIFIED_ROLE_ID)
+    except ValueError:
+        logger.warning("VERIFIED_ROLE_ID must contain only numbers.")
+        return None
+
+
+def build_verification_embed(guild: discord.Guild) -> discord.Embed:
+    embed = discord.Embed(
+        title="🔐 Verify to Gain Access",
+        description=(
+            f"Welcome to **{guild.name}**!\n\n"
+            "To unlock the rest of the server:\n"
+            "**1.** Run `/verify` in this channel.\n"
+            "**2.** Copy the private code the bot gives you.\n"
+            "**3.** Type that code here exactly as shown.\n\n"
+            "Your code is unique, expires after a few minutes, and can only "
+            "be used by you. Messages in this channel are cleaned automatically."
+        ),
+        colour=GOLD_COLOUR,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    embed.add_field(
+        name="Need a new code?",
+        value="Run `/verify` again. Your previous code will stop working.",
+        inline=False,
+    )
+    embed.set_footer(text=VERIFY_EMBED_FOOTER)
+    return embed
+
+
+async def ensure_verification_embed(channel: discord.TextChannel) -> None:
+    try:
+        async for message in channel.history(limit=100):
+            if (
+                message.author.id == bot.user.id
+                and message.embeds
+                and message.embeds[0].footer
+                and message.embeds[0].footer.text == VERIFY_EMBED_FOOTER
+            ):
+                return
+
+        await channel.send(embed=build_verification_embed(channel.guild))
+    except discord.Forbidden:
+        logger.warning("Missing permissions in verification channel %s.", channel.id)
+    except discord.HTTPException:
+        logger.exception("Failed to create verification embed.")
+
+
+async def clean_verification_channel(channel: discord.TextChannel) -> None:
+    await ensure_verification_embed(channel)
+
+    def should_delete(message: discord.Message) -> bool:
+        if message.pinned:
+            return False
+
+        if (
+            message.author.id == bot.user.id
+            and message.embeds
+            and message.embeds[0].footer
+            and message.embeds[0].footer.text == VERIFY_EMBED_FOOTER
+        ):
+            return False
+
+        return True
+
+    try:
+        deleted = await channel.purge(
+            limit=100,
+            check=should_delete,
+            bulk=True,
+            reason="777 verification channel cleanup",
+        )
+        if deleted:
+            logger.info("Deleted %s verification-channel message(s).", len(deleted))
+    except discord.Forbidden:
+        logger.warning("Missing Manage Messages in verification channel %s.", channel.id)
+    except discord.HTTPException:
+        logger.exception("Verification channel cleanup failed.")
+
+
+async def verification_cleanup_loop() -> None:
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        now = int(time.time())
+
+        async with verification_lock:
+            expired_keys = [
+                key
+                for key, data in verification_codes.items()
+                if int(data["expires_at"]) <= now
+            ]
+            for key in expired_keys:
+                verification_codes.pop(key, None)
+
+        channel_id = configured_verify_channel_id()
+        if channel_id is not None:
+            channel = bot.get_channel(channel_id)
+            if isinstance(channel, discord.TextChannel):
+                await clean_verification_channel(channel)
+
+        await asyncio.sleep(max(60, VERIFY_CLEANUP_INTERVAL_SECONDS))
+
+
+async def handle_verification_code(message: discord.Message) -> bool:
+    channel_id = configured_verify_channel_id()
+    if channel_id is None or message.channel.id != channel_id:
+        return False
+
+    if not isinstance(message.author, discord.Member):
+        return True
+
+    submitted_code = message.content.strip().upper()
+
+    try:
+        await message.delete()
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    key = (message.guild.id, message.author.id)
+    now = int(time.time())
+
+    async with verification_lock:
+        code_data = verification_codes.get(key)
+
+        if code_data is None:
+            response = await message.channel.send(
+                f"{message.author.mention}, run `/verify` first to receive a private code."
+            )
+            try:
+                await response.delete(delay=6)
+            except discord.HTTPException:
+                pass
+            return True
+
+        if int(code_data["expires_at"]) <= now:
+            verification_codes.pop(key, None)
+            response = await message.channel.send(
+                f"{message.author.mention}, that code expired. Run `/verify` for a new one."
+            )
+            try:
+                await response.delete(delay=6)
+            except discord.HTTPException:
+                pass
+            return True
+
+        if submitted_code != str(code_data["code"]):
+            response = await message.channel.send(
+                f"{message.author.mention}, that code is incorrect. Try again or run `/verify`."
+            )
+            try:
+                await response.delete(delay=6)
+            except discord.HTTPException:
+                pass
+            return True
+
+        verification_codes.pop(key, None)
+
+    role_id = configured_verified_role_id()
+    role = message.guild.get_role(role_id) if role_id is not None else None
+
+    if role is None:
+        response = await message.channel.send(
+            f"{message.author.mention}, verification is not configured correctly. "
+            "Please tell a server administrator."
+        )
+        try:
+            await response.delete(delay=8)
+        except discord.HTTPException:
+            pass
+        return True
+
+    if role in message.author.roles:
+        response = await message.channel.send(
+            f"✅ {message.author.mention}, you are already verified."
+        )
+    else:
+        try:
+            await message.author.add_roles(
+                role,
+                reason="Completed 777 verification code challenge",
+            )
+            response = await message.channel.send(
+                f"✅ {message.author.mention}, you are now verified. Welcome!"
+            )
+        except discord.Forbidden:
+            response = await message.channel.send(
+                f"{message.author.mention}, I could not give you the verified role. "
+                "My bot role must be above **{role.name}**."
+            )
+        except discord.HTTPException:
+            logger.exception("Failed to grant verified role.")
+            response = await message.channel.send(
+                f"{message.author.mention}, Discord could not complete verification. Try again."
+            )
+
+    try:
+        await response.delete(delay=8)
+    except discord.HTTPException:
+        pass
+
+    return True
+
+
+# =========================================================
 # BOT EVENTS
 # =========================================================
 
@@ -910,6 +1148,14 @@ async def on_ready():
     except Exception:
         logger.exception(
             "Failed to sync application commands."
+        )
+
+    global verification_cleanup_task
+
+    if verification_cleanup_task is None or verification_cleanup_task.done():
+        verification_cleanup_task = asyncio.create_task(
+            verification_cleanup_loop(),
+            name="777-verification-cleanup",
         )
 
     await bot.change_presence(
@@ -1079,6 +1325,9 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
     if message.guild is None:
+        return
+
+    if await handle_verification_code(message):
         return
 
     if await security_check_message(message):
@@ -6607,6 +6856,82 @@ initialize_security_tables()
 # =========================================================
 # SLASH COMMANDS
 # =========================================================
+
+@bot.tree.command(
+    name="verify",
+    description="Receive a private code to verify yourself.",
+)
+async def verify(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "This command can only be used inside the server.",
+            ephemeral=True,
+        )
+        return
+
+    channel_id = configured_verify_channel_id()
+    role_id = configured_verified_role_id()
+
+    if channel_id is None or role_id is None:
+        await interaction.response.send_message(
+            "Verification has not been configured yet.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.channel_id != channel_id:
+        verify_channel = interaction.guild.get_channel(channel_id)
+        channel_text = (
+            verify_channel.mention
+            if isinstance(verify_channel, discord.TextChannel)
+            else "the verification channel"
+        )
+        await interaction.response.send_message(
+            f"Use `/verify` in {channel_text}.",
+            ephemeral=True,
+        )
+        return
+
+    role = interaction.guild.get_role(role_id)
+    if role is None:
+        await interaction.response.send_message(
+            "The configured verified role could not be found. Tell an administrator.",
+            ephemeral=True,
+        )
+        return
+
+    if role in interaction.user.roles:
+        await interaction.response.send_message(
+            "✅ You are already verified.",
+            ephemeral=True,
+        )
+        return
+
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    code = "".join(random.SystemRandom().choice(alphabet) for _ in range(7))
+    expires_at = int(time.time()) + max(60, VERIFY_CODE_EXPIRY_SECONDS)
+
+    async with verification_lock:
+        verification_codes[(interaction.guild.id, interaction.user.id)] = {
+            "code": code,
+            "expires_at": expires_at,
+        }
+
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title="🔐 Your Verification Code",
+            description=(
+                f"Type this code in <#{channel_id}>:\n\n"
+                f"# `{code}`\n\n"
+                f"It expires <t:{expires_at}:R>. Do not share it. "
+                "Running `/verify` again replaces this code."
+            ),
+            colour=GOLD_COLOUR,
+            timestamp=datetime.now(timezone.utc),
+        ).set_footer(text="777 • Private verification code"),
+        ephemeral=True,
+    )
+
 
 @bot.tree.command(
     name="balance",
