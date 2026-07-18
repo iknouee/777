@@ -31,6 +31,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 WELCOME_CHANNEL_ID = os.getenv("WELCOME_CHANNEL_ID")
 COUNTING_CHANNEL_ID = os.getenv("COUNTING_CHANNEL_ID")
 CLIPS_CHANNEL_ID = os.getenv("CLIPS_CHANNEL_ID")
+SUGGESTIONS_CHANNEL_ID = os.getenv("SUGGESTIONS_CHANNEL_ID")
 PORT = int(os.getenv("PORT", "10000"))
 
 BANNER_URL = os.getenv(
@@ -1217,6 +1218,31 @@ bot.tree.add_command(clip_message)
 
 
 # =========================================================
+# LIVE COUNTDOWN HELPERS
+# =========================================================
+
+def countdown_text(seconds_remaining: int) -> str:
+    seconds_remaining = max(0, seconds_remaining)
+    minutes, seconds = divmod(seconds_remaining, 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def countdown_update_interval(seconds_remaining: int) -> int:
+    if seconds_remaining <= 60:
+        return 1
+
+    if seconds_remaining <= 300:
+        return 5
+
+    return 15
+
+
+# =========================================================
 # SMASH OR PASS
 # =========================================================
 
@@ -1236,6 +1262,8 @@ class SmashOrPassView(discord.ui.View):
         self.pass_voters: set[int] = set()
         self.message: discord.Message | None = None
         self.finished = False
+        self.seconds_remaining = duration_seconds
+        self.countdown_task: asyncio.Task | None = None
 
     def totals_text(self) -> str:
         smash_count = len(self.smash_voters)
@@ -1329,7 +1357,7 @@ class SmashOrPassView(discord.ui.View):
         if not final:
             embed.add_field(
                 name="Voting Time",
-                value=f"`{self.duration_seconds} seconds`",
+                value=f"`{countdown_text(self.seconds_remaining)}`",
                 inline=True,
             )
 
@@ -1435,8 +1463,56 @@ class SmashOrPassView(discord.ui.View):
     ):
         await self.update_vote(interaction, "pass")
 
-    async def on_timeout(self):
+    async def start_countdown(self) -> None:
+        if self.countdown_task is None:
+            self.countdown_task = asyncio.create_task(
+                self.countdown_loop()
+            )
+
+    async def countdown_loop(self) -> None:
+        try:
+            while not self.finished and self.seconds_remaining > 0:
+                interval = min(
+                    countdown_update_interval(
+                        self.seconds_remaining
+                    ),
+                    self.seconds_remaining,
+                )
+
+                await asyncio.sleep(interval)
+                self.seconds_remaining = max(
+                    0,
+                    self.seconds_remaining - interval,
+                )
+
+                if self.finished:
+                    return
+
+                if self.seconds_remaining == 0:
+                    await self.finish_vote()
+                    return
+
+                if self.message is not None:
+                    try:
+                        await self.message.edit(
+                            embed=self.build_embed(),
+                            view=self,
+                        )
+                    except discord.HTTPException:
+                        logger.exception(
+                            "Failed to update Smash or Pass timer."
+                        )
+
+        except asyncio.CancelledError:
+            return
+
+    async def finish_vote(self) -> None:
+        if self.finished:
+            return
+
         self.finished = True
+        self.seconds_remaining = 0
+        self.stop()
 
         for item in self.children:
             item.disabled = True
@@ -1454,6 +1530,9 @@ class SmashOrPassView(discord.ui.View):
             logger.exception(
                 "Failed to close a Smash or Pass vote."
             )
+
+    async def on_timeout(self):
+        await self.finish_vote()
 
 
 # =========================================================
@@ -1560,6 +1639,8 @@ class PollView(discord.ui.View):
         self.votes: dict[int, int] = {}
         self.message: discord.Message | None = None
         self.finished = False
+        self.seconds_remaining = duration_seconds
+        self.countdown_task: asyncio.Task | None = None
 
         for index, option in enumerate(options):
             self.add_item(
@@ -1688,7 +1769,7 @@ class PollView(discord.ui.View):
         if not final:
             embed.add_field(
                 name="Time",
-                value=f"`{self.duration_seconds} seconds`",
+                value=f"`{countdown_text(self.seconds_remaining)}`",
                 inline=True,
             )
 
@@ -1770,6 +1851,49 @@ class PollView(discord.ui.View):
             ephemeral=True,
         )
 
+    async def start_countdown(self) -> None:
+        if self.countdown_task is None:
+            self.countdown_task = asyncio.create_task(
+                self.countdown_loop()
+            )
+
+    async def countdown_loop(self) -> None:
+        try:
+            while not self.finished and self.seconds_remaining > 0:
+                interval = min(
+                    countdown_update_interval(
+                        self.seconds_remaining
+                    ),
+                    self.seconds_remaining,
+                )
+
+                await asyncio.sleep(interval)
+                self.seconds_remaining = max(
+                    0,
+                    self.seconds_remaining - interval,
+                )
+
+                if self.finished:
+                    return
+
+                if self.seconds_remaining == 0:
+                    await self.finish_poll()
+                    return
+
+                if self.message is not None:
+                    try:
+                        await self.message.edit(
+                            embed=self.build_embed(),
+                            view=self,
+                        )
+                    except discord.HTTPException:
+                        logger.exception(
+                            "Failed to update poll timer."
+                        )
+
+        except asyncio.CancelledError:
+            return
+
     async def finish_poll(
         self,
         ended_early: bool = False,
@@ -1778,7 +1902,14 @@ class PollView(discord.ui.View):
             return
 
         self.finished = True
+        self.seconds_remaining = 0
         self.stop()
+
+        if (
+            self.countdown_task is not None
+            and self.countdown_task is not asyncio.current_task()
+        ):
+            self.countdown_task.cancel()
 
         for item in self.children:
             item.disabled = True
@@ -1805,8 +1936,304 @@ class PollView(discord.ui.View):
 
 
 # =========================================================
+# SUGGESTIONS
+# =========================================================
+
+def configured_suggestions_channel_id() -> int | None:
+    if not SUGGESTIONS_CHANNEL_ID:
+        return None
+
+    try:
+        return int(SUGGESTIONS_CHANNEL_ID)
+
+    except ValueError:
+        logger.warning(
+            "SUGGESTIONS_CHANNEL_ID must contain only numbers."
+        )
+        return None
+
+
+def get_suggestions_channel(
+    guild: discord.Guild,
+) -> discord.TextChannel | None:
+    channel_id = configured_suggestions_channel_id()
+
+    if channel_id is None:
+        return None
+
+    channel = guild.get_channel(channel_id)
+
+    if isinstance(channel, discord.TextChannel):
+        return channel
+
+    return None
+
+
+class SuggestionView(discord.ui.View):
+    def __init__(
+        self,
+        author: discord.Member | discord.User,
+        suggestion_text: str,
+    ):
+        super().__init__(timeout=None)
+
+        self.author = author
+        self.suggestion_text = suggestion_text
+        self.upvotes: set[int] = set()
+        self.downvotes: set[int] = set()
+        self.status = "Pending"
+        self.message: discord.Message | None = None
+
+    def build_embed(self) -> discord.Embed:
+        status_icons = {
+            "Pending": "🟡",
+            "Accepted": "🟢",
+            "Rejected": "🔴",
+        }
+
+        embed = discord.Embed(
+            title="💡 777 Suggestion",
+            description=self.suggestion_text,
+            colour=GOLD_COLOUR,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        embed.set_author(
+            name=self.author.display_name,
+            icon_url=self.author.display_avatar.url,
+        )
+
+        embed.add_field(
+            name="Status",
+            value=(
+                f"{status_icons.get(self.status, '🟡')} "
+                f"**{self.status}**"
+            ),
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Votes",
+            value=(
+                f"👍 `{len(self.upvotes)}`\n"
+                f"👎 `{len(self.downvotes)}`"
+            ),
+            inline=True,
+        )
+
+        embed.set_footer(
+            text=f"Suggested by {self.author.display_name} • 777"
+        )
+
+        return embed
+
+    async def update_message(self) -> None:
+        if self.message is None:
+            return
+
+        try:
+            await self.message.edit(
+                embed=self.build_embed(),
+                view=self,
+            )
+        except discord.HTTPException:
+            logger.exception(
+                "Failed to update suggestion."
+            )
+
+    async def register_vote(
+        self,
+        interaction: discord.Interaction,
+        upvote: bool,
+    ) -> None:
+        if self.status != "Pending":
+            await interaction.response.send_message(
+                "Voting is closed because this suggestion has been reviewed.",
+                ephemeral=True,
+            )
+            return
+
+        user_id = interaction.user.id
+
+        if upvote:
+            self.downvotes.discard(user_id)
+            self.upvotes.add(user_id)
+            vote_text = "👍 upvoted"
+        else:
+            self.upvotes.discard(user_id)
+            self.downvotes.add(user_id)
+            vote_text = "👎 downvoted"
+
+        await interaction.response.edit_message(
+            embed=self.build_embed(),
+            view=self,
+        )
+
+        await interaction.followup.send(
+            f"You {vote_text} this suggestion.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Upvote",
+        emoji="👍",
+        style=discord.ButtonStyle.success,
+        custom_id="777_suggestion_upvote",
+    )
+    async def upvote_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await self.register_vote(interaction, True)
+
+    @discord.ui.button(
+        label="Downvote",
+        emoji="👎",
+        style=discord.ButtonStyle.danger,
+        custom_id="777_suggestion_downvote",
+    )
+    async def downvote_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await self.register_vote(interaction, False)
+
+    async def review(
+        self,
+        interaction: discord.Interaction,
+        new_status: str,
+    ) -> None:
+        permissions = getattr(
+            interaction.user,
+            "guild_permissions",
+            None,
+        )
+
+        if not permissions or not permissions.manage_messages:
+            await interaction.response.send_message(
+                "Only moderators can review suggestions.",
+                ephemeral=True,
+            )
+            return
+
+        self.status = new_status
+
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            embed=self.build_embed(),
+            view=self,
+        )
+
+        await interaction.followup.send(
+            f"Suggestion marked as **{new_status}**.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Accept",
+        emoji="✅",
+        style=discord.ButtonStyle.primary,
+        custom_id="777_suggestion_accept",
+        row=1,
+    )
+    async def accept_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await self.review(interaction, "Accepted")
+
+    @discord.ui.button(
+        label="Reject",
+        emoji="⛔",
+        style=discord.ButtonStyle.secondary,
+        custom_id="777_suggestion_reject",
+        row=1,
+    )
+    async def reject_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await self.review(interaction, "Rejected")
+
+
+# =========================================================
 # SLASH COMMANDS
 # =========================================================
+
+@bot.tree.command(
+    name="suggest",
+    description="Submit a suggestion for the server.",
+)
+@app_commands.describe(
+    idea="The suggestion you want to submit."
+)
+async def suggest(
+    interaction: discord.Interaction,
+    idea: app_commands.Range[str, 5, 1500],
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    suggestions_channel = get_suggestions_channel(
+        interaction.guild
+    )
+
+    if suggestions_channel is None:
+        await interaction.response.send_message(
+            "The suggestions channel has not been configured. "
+            "Add `SUGGESTIONS_CHANNEL_ID` in Render.",
+            ephemeral=True,
+        )
+        return
+
+    view = SuggestionView(
+        author=interaction.user,
+        suggestion_text=idea.strip(),
+    )
+
+    try:
+        suggestion_message = await suggestions_channel.send(
+            embed=view.build_embed(),
+            view=view,
+        )
+
+        view.message = suggestion_message
+
+        try:
+            await suggestion_message.create_thread(
+                name=f"Suggestion by {interaction.user.display_name}"[:100],
+                auto_archive_duration=1440,
+                reason="Discussion thread for a 777 suggestion.",
+            )
+        except (
+            discord.Forbidden,
+            discord.HTTPException,
+        ):
+            pass
+
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I cannot post in the suggestions channel. "
+            "Check my permissions there.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"Your suggestion was posted: {suggestion_message.jump_url}",
+        ephemeral=True,
+    )
+
 
 @bot.tree.command(
     name="poll",
@@ -1878,6 +2305,7 @@ async def poll(
     )
 
     view.message = await interaction.original_response()
+    await view.start_countdown()
 
 
 @bot.tree.command(
@@ -1926,6 +2354,7 @@ async def smash_or_pass(
     )
 
     view.message = await interaction.original_response()
+    await view.start_countdown()
 
 
 @bot.tree.command(
