@@ -1,10 +1,13 @@
+import asyncio
 import io
+import json
 import logging
 import os
 import re
 import textwrap
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -26,6 +29,7 @@ logger = logging.getLogger("777-bot")
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 WELCOME_CHANNEL_ID = os.getenv("WELCOME_CHANNEL_ID")
+COUNTING_CHANNEL_ID = os.getenv("COUNTING_CHANNEL_ID")
 PORT = int(os.getenv("PORT", "10000"))
 
 BANNER_URL = os.getenv(
@@ -45,6 +49,9 @@ GOLD_RGB = (255, 191, 36)
 SOFT_GOLD_RGB = (235, 190, 90)
 WHITE_RGB = (245, 245, 245)
 GREY_RGB = (170, 170, 170)
+
+COUNTING_STATE_FILE = Path("counting_state.json")
+counting_lock = asyncio.Lock()
 
 if not TOKEN:
     raise RuntimeError(
@@ -94,6 +101,123 @@ def run_web_server():
 
 
 # =========================================================
+# COUNTING STORAGE
+# =========================================================
+
+def default_counting_state() -> dict:
+    return {
+        "current": 0,
+        "highest": 0,
+        "last_user_id": None,
+        "last_message_id": None,
+    }
+
+
+def load_counting_states() -> dict:
+    if not COUNTING_STATE_FILE.exists():
+        return {}
+
+    try:
+        with COUNTING_STATE_FILE.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        return data if isinstance(data, dict) else {}
+
+    except (OSError, json.JSONDecodeError):
+        logger.exception("Failed to load counting state.")
+        return {}
+
+
+def save_counting_states(states: dict) -> None:
+    temporary_file = COUNTING_STATE_FILE.with_suffix(".tmp")
+
+    try:
+        with temporary_file.open("w", encoding="utf-8") as file:
+            json.dump(states, file, indent=2)
+
+        temporary_file.replace(COUNTING_STATE_FILE)
+
+    except OSError:
+        logger.exception("Failed to save counting state.")
+
+
+counting_states = load_counting_states()
+
+
+def get_counting_state(guild_id: int) -> dict:
+    key = str(guild_id)
+
+    state = counting_states.get(key)
+
+    if not isinstance(state, dict):
+        state = default_counting_state()
+        counting_states[key] = state
+
+    defaults = default_counting_state()
+
+    for field, default_value in defaults.items():
+        state.setdefault(field, default_value)
+
+    return state
+
+
+def configured_counting_channel_id() -> int | None:
+    if not COUNTING_CHANNEL_ID:
+        return None
+
+    try:
+        return int(COUNTING_CHANNEL_ID)
+
+    except ValueError:
+        logger.warning("COUNTING_CHANNEL_ID must contain only numbers.")
+        return None
+
+
+async def reset_counting(
+    channel: discord.TextChannel,
+    state: dict,
+    reason: str,
+    member: discord.Member | discord.User | None = None,
+) -> None:
+    previous_count = int(state.get("current", 0))
+
+    state["current"] = 0
+    state["last_user_id"] = None
+    state["last_message_id"] = None
+
+    save_counting_states(counting_states)
+
+    embed = discord.Embed(
+        title="💥 Counting Reset",
+        description=reason,
+        colour=discord.Colour.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    if member:
+        embed.set_author(
+            name=member.display_name,
+            icon_url=member.display_avatar.url,
+        )
+
+    embed.add_field(
+        name="Previous streak",
+        value=f"`{previous_count}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Start again",
+        value="The next number is **1**.",
+        inline=True,
+    )
+
+    embed.set_footer(text="777 • Counting")
+
+    await channel.send(embed=embed)
+
+
+# =========================================================
 # GENERAL HELPERS
 # =========================================================
 
@@ -133,51 +257,30 @@ def get_welcome_channel(
 
 
 def clean_message_content(message: discord.Message) -> str:
-    """
-    Converts raw mentions into readable names and removes
-    excess whitespace.
-    """
-
     content = message.clean_content.strip()
-
-    content = re.sub(
-        r"\s+",
-        " ",
-        content,
-    )
-
-    return content
+    return re.sub(r"\s+", " ", content)
 
 
 def get_font(
     size: int,
     bold: bool = False,
 ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    possible_paths = []
-
     if bold:
-        possible_paths.extend(
-            [
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                "/usr/share/fonts/dejavu/DejaVuSansCondensed-Bold.ttf",
-                "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-            ]
-        )
+        possible_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSansCondensed-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        ]
     else:
-        possible_paths.extend(
-            [
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/dejavu/DejaVuSansCondensed.ttf",
-                "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-            ]
-        )
+        possible_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSansCondensed.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ]
 
     for path in possible_paths:
         if os.path.exists(path):
-            return ImageFont.truetype(
-                path,
-                size=size,
-            )
+            return ImageFont.truetype(path, size=size)
 
     return ImageFont.load_default()
 
@@ -190,16 +293,7 @@ def fit_text(
     starting_size: int = 68,
     minimum_size: int = 32,
 ) -> tuple[ImageFont.ImageFont, list[str]]:
-    """
-    Finds a font size and wrapped lines that fit within the
-    allowed quote area.
-    """
-
-    for size in range(
-        starting_size,
-        minimum_size - 1,
-        -2,
-    ):
+    for size in range(starting_size, minimum_size - 1, -2):
         font = get_font(size)
 
         average_character_width = max(
@@ -223,19 +317,11 @@ def fit_text(
         )
 
         line_spacing = int(size * 0.35)
-
         line_heights = []
 
         for line in lines:
-            box = draw.textbbox(
-                (0, 0),
-                line,
-                font=font,
-            )
-
-            line_heights.append(
-                box[3] - box[1]
-            )
+            box = draw.textbbox((0, 0), line, font=font)
+            line_heights.append(box[3] - box[1])
 
         total_height = (
             sum(line_heights)
@@ -244,19 +330,13 @@ def fit_text(
 
         widest_line = max(
             (
-                draw.textlength(
-                    line,
-                    font=font,
-                )
+                draw.textlength(line, font=font)
                 for line in lines
             ),
             default=0,
         )
 
-        if (
-            widest_line <= max_width
-            and total_height <= max_height
-        ):
+        if widest_line <= max_width and total_height <= max_height:
             return font, lines
 
     font = get_font(minimum_size)
@@ -309,9 +389,7 @@ async def create_quote_image(
     quote_text = clean_message_content(message)
 
     if not quote_text:
-        raise ValueError(
-            "This message does not contain any text."
-        )
+        raise ValueError("This message does not contain any text.")
 
     if len(quote_text) > 800:
         quote_text = quote_text[:797] + "..."
@@ -354,13 +432,11 @@ async def create_quote_image(
 
     draw = ImageDraw.Draw(canvas)
 
-    # Left-side gold accent
     draw.rectangle(
         (0, 0, 12, height),
         fill=GOLD_RGB,
     )
 
-    # Subtle top and bottom lines
     draw.line(
         (70, 56, width - 70, 56),
         fill=(255, 191, 36, 120),
@@ -373,11 +449,7 @@ async def create_quote_image(
         width=2,
     )
 
-    # Decorative quotation mark
-    quote_mark_font = get_font(
-        150,
-        bold=True,
-    )
+    quote_mark_font = get_font(150, bold=True)
 
     draw.text(
         (70, 68),
@@ -405,11 +477,7 @@ async def create_quote_image(
     line_dimensions = []
 
     for line in wrapped_lines:
-        box = draw.textbbox(
-            (0, 0),
-            line,
-            font=quote_font,
-        )
+        box = draw.textbbox((0, 0), line, font=quote_font)
 
         line_dimensions.append(
             (
@@ -458,28 +526,12 @@ async def create_quote_image(
         current_y += line_height + line_spacing
 
     display_name = message.author.display_name
-
     username = str(message.author)
 
-    author_font = get_font(
-        30,
-        bold=True,
-    )
-
-    username_font = get_font(
-        19,
-        bold=False,
-    )
-
-    date_font = get_font(
-        18,
-        bold=False,
-    )
-
-    footer_font = get_font(
-        17,
-        bold=True,
-    )
+    author_font = get_font(30, bold=True)
+    username_font = get_font(19)
+    date_font = get_font(18)
+    footer_font = get_font(17, bold=True)
 
     author_text = f"— {display_name}"
 
@@ -488,10 +540,8 @@ async def create_quote_image(
         font=author_font,
     )
 
-    author_x = width - 85 - author_width
-
     draw.text(
-        (author_x, 495),
+        (width - 85 - author_width, 495),
         author_text,
         font=author_font,
         fill=SOFT_GOLD_RGB,
@@ -505,10 +555,7 @@ async def create_quote_image(
     )
 
     draw.text(
-        (
-            width - 85 - username_width,
-            535,
-        ),
+        (width - 85 - username_width, 535),
         username_text,
         font=username_font,
         fill=GREY_RGB,
@@ -537,10 +584,7 @@ async def create_quote_image(
     )
 
     draw.text(
-        (
-            width - footer_width - 72,
-            height - 47,
-        ),
+        (width - footer_width - 72, height - 47),
         footer_text,
         font=footer_font,
         fill=SOFT_GOLD_RGB,
@@ -585,10 +629,7 @@ async def send_quote_result(
 
     try:
         image = await create_quote_image(message)
-
-        filename = (
-            f"777_quote_{message.id}.png"
-        )
+        filename = f"777_quote_{message.id}.png"
 
         file = discord.File(
             image,
@@ -610,10 +651,7 @@ async def send_quote_result(
         )
 
         quote_embed.set_footer(
-            text=(
-                f"Made by {interaction.user.display_name} "
-                "• 777"
-            ),
+            text=f"Made by {interaction.user.display_name} • 777",
             icon_url=interaction.user.display_avatar.url,
         )
 
@@ -629,9 +667,7 @@ async def send_quote_result(
         )
 
     except Exception:
-        logger.exception(
-            "Failed to create quote image."
-        )
+        logger.exception("Failed to create quote image.")
 
         await interaction.followup.send(
             "Something went wrong while creating the quote.",
@@ -676,9 +712,7 @@ async def on_ready():
 async def on_member_join(
     member: discord.Member,
 ):
-    channel = get_welcome_channel(
-        member.guild
-    )
+    channel = get_welcome_channel(member.guild)
 
     if channel is None:
         logger.warning(
@@ -687,9 +721,7 @@ async def on_member_join(
         )
         return
 
-    member_number = (
-        member.guild.member_count or 0
-    )
+    member_number = member.guild.member_count or 0
 
     embed = discord.Embed(
         title="✦ Welcome to 777 ✦",
@@ -716,9 +748,7 @@ async def on_member_join(
     )
 
     if BANNER_URL:
-        embed.set_image(
-            url=BANNER_URL
-        )
+        embed.set_image(url=BANNER_URL)
 
     embed.add_field(
         name="Member",
@@ -750,17 +780,13 @@ async def on_member_join(
 
     try:
         await channel.send(
-            content=(
-                f"Welcome to the server, "
-                f"{member.mention}! 👑"
-            ),
+            content=f"Welcome to the server, {member.mention}! 👑",
             embed=embed,
         )
 
     except discord.Forbidden:
         logger.warning(
-            "Missing permission to send welcome "
-            "messages in %s.",
+            "Missing permission to send welcome messages in %s.",
             channel.name,
         )
 
@@ -774,9 +800,7 @@ async def on_member_join(
 async def on_member_remove(
     member: discord.Member,
 ):
-    channel = get_welcome_channel(
-        member.guild
-    )
+    channel = get_welcome_channel(member.guild)
 
     if channel is None:
         logger.warning(
@@ -809,9 +833,7 @@ async def on_member_remove(
     )
 
     if BANNER_URL:
-        embed.set_image(
-            url=BANNER_URL
-        )
+        embed.set_image(url=BANNER_URL)
 
     embed.set_footer(
         text=(
@@ -821,14 +843,11 @@ async def on_member_remove(
     )
 
     try:
-        await channel.send(
-            embed=embed
-        )
+        await channel.send(embed=embed)
 
     except discord.Forbidden:
         logger.warning(
-            "Missing permission to send goodbye "
-            "messages in %s.",
+            "Missing permission to send goodbye messages in %s.",
             channel.name,
         )
 
@@ -836,6 +855,127 @@ async def on_member_remove(
         logger.exception(
             "Failed to send goodbye message."
         )
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    await bot.process_commands(message)
+
+    if message.guild is None:
+        return
+
+    counting_channel_id = configured_counting_channel_id()
+
+    if (
+        counting_channel_id is None
+        or message.channel.id != counting_channel_id
+    ):
+        return
+
+    # Prefix commands are allowed to pass through without affecting counting.
+    if message.content.startswith(bot.command_prefix):
+        return
+
+    raw_content = message.content.strip()
+
+    # The counting channel should contain numbers only.
+    if not re.fullmatch(r"\d+", raw_content):
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        warning = await message.channel.send(
+            f"{message.author.mention}, numbers only in the counting channel."
+        )
+
+        try:
+            await warning.delete(delay=5)
+        except discord.HTTPException:
+            pass
+
+        return
+
+    submitted_number = int(raw_content)
+
+    async with counting_lock:
+        state = get_counting_state(message.guild.id)
+        expected_number = int(state["current"]) + 1
+        last_user_id = state.get("last_user_id")
+
+        if last_user_id == message.author.id:
+            try:
+                await message.add_reaction("❌")
+            except discord.HTTPException:
+                pass
+
+            await reset_counting(
+                channel=message.channel,
+                state=state,
+                reason=(
+                    f"{message.author.mention} counted twice in a row.\n"
+                    "Different people must take turns."
+                ),
+                member=message.author,
+            )
+            return
+
+        if submitted_number != expected_number:
+            try:
+                await message.add_reaction("❌")
+            except discord.HTTPException:
+                pass
+
+            await reset_counting(
+                channel=message.channel,
+                state=state,
+                reason=(
+                    f"{message.author.mention} sent **{submitted_number}**, "
+                    f"but the correct number was **{expected_number}**."
+                ),
+                member=message.author,
+            )
+            return
+
+        state["current"] = submitted_number
+        state["last_user_id"] = message.author.id
+        state["last_message_id"] = message.id
+
+        if submitted_number > int(state["highest"]):
+            state["highest"] = submitted_number
+
+        save_counting_states(counting_states)
+
+        try:
+            await message.add_reaction("✅")
+        except discord.HTTPException:
+            pass
+
+        if submitted_number % 100 == 0:
+            milestone_embed = discord.Embed(
+                title="🎉 Counting Milestone!",
+                description=(
+                    f"The server reached **{submitted_number}**!\n"
+                    f"Keep going — the next number is **{submitted_number + 1}**."
+                ),
+                colour=GOLD_COLOUR,
+                timestamp=datetime.now(timezone.utc),
+            )
+
+            milestone_embed.set_footer(
+                text="777 • Counting"
+            )
+
+            await message.channel.send(
+                content="@here",
+                embed=milestone_embed,
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=True
+                ),
+            )
 
 
 # =========================================================
@@ -849,19 +989,11 @@ async def make_it_a_quote(
     interaction: discord.Interaction,
     message: discord.Message,
 ):
-    await interaction.response.defer(
-        thinking=True
-    )
-
-    await send_quote_result(
-        interaction,
-        message,
-    )
+    await interaction.response.defer(thinking=True)
+    await send_quote_result(interaction, message)
 
 
-bot.tree.add_command(
-    make_it_a_quote
-)
+bot.tree.add_command(make_it_a_quote)
 
 
 # =========================================================
@@ -875,15 +1007,11 @@ bot.tree.add_command(
 async def ping(
     interaction: discord.Interaction,
 ):
-    latency = round(
-        bot.latency * 1000
-    )
+    latency = round(bot.latency * 1000)
 
     embed = discord.Embed(
         title="🏓 777 is online",
-        description=(
-            f"Current latency: `{latency}ms`"
-        ),
+        description=f"Current latency: `{latency}ms`",
         colour=GOLD_COLOUR,
         timestamp=datetime.now(timezone.utc),
     )
@@ -897,9 +1025,7 @@ async def ping(
         text="777 • Running normally"
     )
 
-    await interaction.response.send_message(
-        embed=embed
-    )
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(
@@ -920,19 +1046,16 @@ async def about(
     )
 
     if BANNER_URL:
-        embed.set_image(
-            url=BANNER_URL
-        )
+        embed.set_image(url=BANNER_URL)
 
     embed.add_field(
         name="Current Features",
         value=(
-            "• Welcome messages\n"
-            "• Goodbye messages\n"
+            "• Welcome and goodbye messages\n"
             "• Quote image generator\n"
             "• Right-click message quoting\n"
-            "• `/quote`\n"
-            "• `!quote` replies\n"
+            "• Counting channel with streak tracking\n"
+            "• `/counting`\n"
             "• `/ping`\n"
             "• `/about`"
         ),
@@ -940,24 +1063,23 @@ async def about(
     )
 
     embed.add_field(
-        name="How to Make a Quote",
+        name="Quote Commands",
         value=(
             "Right-click a message and select:\n"
             "**Apps → Make it a Quote**\n\n"
-            "You can also run `/quote` with a "
-            "message link, or reply with `!quote`."
+            "You can also use `/quote` with a message link "
+            "or reply with `!quote`."
         ),
         inline=False,
     )
 
     embed.add_field(
-        name="Coming Soon",
+        name="Counting Rules",
         value=(
-            "• Saved quote database\n"
-            "• Clips\n"
-            "• Counting\n"
-            "• Smash or Pass\n"
-            "• Polls"
+            "• Count upward one number at a time\n"
+            "• You cannot count twice in a row\n"
+            "• A wrong number resets the streak\n"
+            "• Use `/counting` to view the current record"
         ),
         inline=False,
     )
@@ -966,9 +1088,133 @@ async def about(
         text="Made for the 777 friend group"
     )
 
-    await interaction.response.send_message(
-        embed=embed
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="counting",
+    description="View the current counting streak and record.",
+)
+async def counting_status(
+    interaction: discord.Interaction,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    state = get_counting_state(interaction.guild.id)
+    current = int(state["current"])
+    highest = int(state["highest"])
+
+    next_number = current + 1
+
+    counting_channel_id = configured_counting_channel_id()
+    channel_text = (
+        f"<#{counting_channel_id}>"
+        if counting_channel_id
+        else "Not configured"
     )
+
+    embed = discord.Embed(
+        title="🔢 777 Counting",
+        description=(
+            f"The next number is **{next_number}**."
+        ),
+        colour=GOLD_COLOUR,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    embed.add_field(
+        name="Current streak",
+        value=f"`{current}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Highest streak",
+        value=f"`{highest}`",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Channel",
+        value=channel_text,
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Rules",
+        value=(
+            "Count one number at a time, and do not "
+            "count twice in a row."
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(text="777 • Counting")
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="counting_reset",
+    description="Reset the counting streak. Administrators only.",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def counting_reset_command(
+    interaction: discord.Interaction,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    state = get_counting_state(interaction.guild.id)
+    state["current"] = 0
+    state["last_user_id"] = None
+    state["last_message_id"] = None
+
+    save_counting_states(counting_states)
+
+    embed = discord.Embed(
+        title="🔄 Counting Reset",
+        description=(
+            f"{interaction.user.mention} reset the counting streak.\n"
+            "The next number is **1**."
+        ),
+        colour=GOLD_COLOUR,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    embed.set_footer(text="777 • Counting")
+
+    await interaction.response.send_message(embed=embed)
+
+
+@counting_reset_command.error
+async def counting_reset_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "Only server administrators can reset counting.",
+            ephemeral=True,
+        )
+        return
+
+    logger.exception("Counting reset command failed: %s", error)
+
+    if not interaction.response.is_done():
+        await interaction.response.send_message(
+            "Something went wrong while resetting counting.",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(
@@ -976,17 +1222,13 @@ async def about(
     description="Turn a Discord message into a quote image.",
 )
 @app_commands.describe(
-    message_link=(
-        "Paste the Discord message link you want to quote."
-    )
+    message_link="Paste the Discord message link you want to quote."
 )
 async def quote_slash(
     interaction: discord.Interaction,
     message_link: str,
 ):
-    await interaction.response.defer(
-        thinking=True
-    )
+    await interaction.response.defer(thinking=True)
 
     match = re.search(
         r"discord(?:app)?\.com/channels/"
@@ -1001,17 +1243,9 @@ async def quote_slash(
         )
         return
 
-    guild_id = int(
-        match.group(1)
-    )
-
-    channel_id = int(
-        match.group(2)
-    )
-
-    message_id = int(
-        match.group(3)
-    )
+    guild_id = int(match.group(1))
+    channel_id = int(match.group(2))
+    message_id = int(match.group(3))
 
     if (
         interaction.guild is None
@@ -1023,14 +1257,9 @@ async def quote_slash(
         )
         return
 
-    channel = interaction.guild.get_channel(
-        channel_id
-    )
+    channel = interaction.guild.get_channel(channel_id)
 
-    if not isinstance(
-        channel,
-        discord.TextChannel,
-    ):
+    if not isinstance(channel, discord.TextChannel):
         await interaction.followup.send(
             "I could not find that text channel.",
             ephemeral=True,
@@ -1038,9 +1267,7 @@ async def quote_slash(
         return
 
     try:
-        message = await channel.fetch_message(
-            message_id
-        )
+        message = await channel.fetch_message(message_id)
 
     except discord.NotFound:
         await interaction.followup.send(
@@ -1056,27 +1283,18 @@ async def quote_slash(
         )
         return
 
-    await send_quote_result(
-        interaction,
-        message,
-    )
+    await send_quote_result(interaction, message)
 
 
 # =========================================================
 # PREFIX QUOTE COMMAND
 # =========================================================
 
-@bot.command(
-    name="quote"
-)
+@bot.command(name="quote")
 @commands.guild_only()
 async def quote_reply(
     context: commands.Context,
 ):
-    """
-    Reply to a message with !quote.
-    """
-
     if not context.message.reference:
         await context.reply(
             "Reply to a message with `!quote` "
@@ -1087,18 +1305,13 @@ async def quote_reply(
 
     resolved = context.message.reference.resolved
 
-    if isinstance(
-        resolved,
-        discord.Message,
-    ):
+    if isinstance(resolved, discord.Message):
         target_message = resolved
 
     else:
         try:
-            target_message = (
-                await context.channel.fetch_message(
-                    context.message.reference.message_id
-                )
+            target_message = await context.channel.fetch_message(
+                context.message.reference.message_id
             )
 
         except (
@@ -1107,8 +1320,7 @@ async def quote_reply(
             discord.HTTPException,
         ):
             await context.reply(
-                "I could not access the message "
-                "you replied to.",
+                "I could not access the message you replied to.",
                 mention_author=False,
             )
             return
@@ -1120,9 +1332,7 @@ async def quote_reply(
         )
         return
 
-    quote_text = clean_message_content(
-        target_message
-    )
+    quote_text = clean_message_content(target_message)
 
     if not quote_text:
         await context.reply(
@@ -1133,13 +1343,8 @@ async def quote_reply(
 
     async with context.typing():
         try:
-            image = await create_quote_image(
-                target_message
-            )
-
-            filename = (
-                f"777_quote_{target_message.id}.png"
-            )
+            image = await create_quote_image(target_message)
+            filename = f"777_quote_{target_message.id}.png"
 
             file = discord.File(
                 image,
@@ -1149,8 +1354,7 @@ async def quote_reply(
             embed = discord.Embed(
                 title="✦ Make it a Quote ✦",
                 description=(
-                    f"Quoted "
-                    f"**{target_message.author.display_name}**\n"
+                    f"Quoted **{target_message.author.display_name}**\n"
                     f"[Jump to the original message]"
                     f"({target_message.jump_url})"
                 ),
@@ -1182,8 +1386,7 @@ async def quote_reply(
             )
 
             await context.reply(
-                "Something went wrong while creating "
-                "the quote.",
+                "Something went wrong while creating the quote.",
                 mention_author=False,
             )
 
@@ -1197,15 +1400,13 @@ async def on_command_error(
     context: commands.Context,
     error: commands.CommandError,
 ):
-    if isinstance(
-        error,
-        commands.CommandNotFound,
-    ):
+    if isinstance(error, commands.CommandNotFound):
         return
 
-    logger.exception(
+    logger.error(
         "Prefix command error: %s",
         error,
+        exc_info=error,
     )
 
     try:
