@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import random
 import textwrap
 import threading
 from datetime import datetime, timezone
@@ -2163,8 +2164,535 @@ class SuggestionView(discord.ui.View):
 
 
 # =========================================================
+# GIVEAWAYS
+# =========================================================
+
+class GiveawayEnterButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Enter Giveaway",
+            emoji="🎉",
+            style=discord.ButtonStyle.success,
+            custom_id="777_giveaway_enter",
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction,
+    ):
+        view = self.view
+
+        if not isinstance(view, GiveawayView):
+            await interaction.response.send_message(
+                "This giveaway is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        await view.toggle_entry(interaction)
+
+
+class GiveawayEndButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="End Giveaway",
+            emoji="🛑",
+            style=discord.ButtonStyle.danger,
+            custom_id="777_giveaway_end",
+            row=1,
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction,
+    ):
+        view = self.view
+
+        if not isinstance(view, GiveawayView):
+            await interaction.response.send_message(
+                "This giveaway is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        if interaction.user.id != view.creator.id:
+            permissions = getattr(
+                interaction.user,
+                "guild_permissions",
+                None,
+            )
+
+            if not permissions or not permissions.manage_messages:
+                await interaction.response.send_message(
+                    "Only the giveaway creator or a moderator can end it.",
+                    ephemeral=True,
+                )
+                return
+
+        await interaction.response.defer(ephemeral=True)
+        await view.finish_giveaway(ended_early=True)
+
+        await interaction.followup.send(
+            "The giveaway has been ended.",
+            ephemeral=True,
+        )
+
+
+class GiveawayRerollButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Reroll",
+            emoji="🔁",
+            style=discord.ButtonStyle.primary,
+            custom_id="777_giveaway_reroll",
+            row=1,
+            disabled=True,
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction,
+    ):
+        view = self.view
+
+        if not isinstance(view, GiveawayView):
+            await interaction.response.send_message(
+                "This giveaway is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        permissions = getattr(
+            interaction.user,
+            "guild_permissions",
+            None,
+        )
+
+        if (
+            interaction.user.id != view.creator.id
+            and (
+                not permissions
+                or not permissions.manage_messages
+            )
+        ):
+            await interaction.response.send_message(
+                "Only the giveaway creator or a moderator can reroll.",
+                ephemeral=True,
+            )
+            return
+
+        if not view.finished:
+            await interaction.response.send_message(
+                "The giveaway must end before it can be rerolled.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        winners = await view.select_winners()
+
+        if not winners:
+            await interaction.followup.send(
+                "There are no eligible entrants to reroll.",
+                ephemeral=True,
+            )
+            return
+
+        winner_mentions = ", ".join(
+            winner.mention
+            for winner in winners
+        )
+
+        if view.message is not None:
+            await view.message.reply(
+                f"🔁 **Giveaway reroll:** {winner_mentions} won "
+                f"**{view.prize}**!",
+                allowed_mentions=discord.AllowedMentions(
+                    users=True,
+                    roles=False,
+                    everyone=False,
+                ),
+            )
+
+        await interaction.followup.send(
+            f"Rerolled winner(s): {winner_mentions}",
+            ephemeral=True,
+        )
+
+
+class GiveawayView(discord.ui.View):
+    def __init__(
+        self,
+        prize: str,
+        creator: discord.Member | discord.User,
+        winner_count: int,
+        duration_seconds: int,
+        required_role: discord.Role | None = None,
+    ):
+        super().__init__(timeout=duration_seconds)
+
+        self.prize = prize
+        self.creator = creator
+        self.winner_count = winner_count
+        self.duration_seconds = duration_seconds
+        self.required_role = required_role
+
+        self.entries: set[int] = set()
+        self.message: discord.Message | None = None
+        self.finished = False
+        self.seconds_remaining = duration_seconds
+        self.countdown_task: asyncio.Task | None = None
+        self.last_winners: list[discord.Member] = []
+
+        self.add_item(GiveawayEnterButton())
+        self.add_item(GiveawayEndButton())
+        self.add_item(GiveawayRerollButton())
+
+    def build_embed(
+        self,
+        final: bool = False,
+        ended_early: bool = False,
+    ) -> discord.Embed:
+        if final:
+            if self.last_winners:
+                winner_mentions = ", ".join(
+                    winner.mention
+                    for winner in self.last_winners
+                )
+
+                result_text = (
+                    f"🎉 **Winner{'s' if len(self.last_winners) != 1 else ''}:** "
+                    f"{winner_mentions}"
+                )
+            else:
+                result_text = "No eligible entrants joined."
+
+            ending_text = (
+                "The giveaway was ended early."
+                if ended_early
+                else "The giveaway has ended."
+            )
+
+            description = (
+                f"**Prize:** {self.prize}\n\n"
+                f"{ending_text}\n"
+                f"{result_text}"
+            )
+
+            title = "🎉 Giveaway Results"
+
+        else:
+            description = (
+                f"**Prize:** {self.prize}\n\n"
+                "Press **Enter Giveaway** below to join. "
+                "Press it again to leave."
+            )
+
+            title = "🎉 777 Giveaway"
+
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            colour=GOLD_COLOUR,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        embed.add_field(
+            name="Entries",
+            value=f"`{len(self.entries)}`",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Winners",
+            value=f"`{self.winner_count}`",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Hosted By",
+            value=self.creator.mention,
+            inline=True,
+        )
+
+        if self.required_role is not None:
+            embed.add_field(
+                name="Required Role",
+                value=self.required_role.mention,
+                inline=True,
+            )
+
+        if not final:
+            embed.add_field(
+                name="Time Remaining",
+                value=f"`{countdown_text(self.seconds_remaining)}`",
+                inline=True,
+            )
+
+        embed.set_footer(
+            text=(
+                "777 • Giveaway open"
+                if not final
+                else "777 • Giveaway closed"
+            )
+        )
+
+        return embed
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.bot:
+            await interaction.response.send_message(
+                "Bots cannot enter giveaways.",
+                ephemeral=True,
+            )
+            return False
+
+        if self.finished:
+            await interaction.response.send_message(
+                "This giveaway has already ended.",
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+    async def toggle_entry(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if (
+            self.required_role is not None
+            and isinstance(interaction.user, discord.Member)
+            and self.required_role not in interaction.user.roles
+        ):
+            await interaction.response.send_message(
+                f"You need the {self.required_role.mention} role to enter.",
+                ephemeral=True,
+            )
+            return
+
+        user_id = interaction.user.id
+
+        if user_id in self.entries:
+            self.entries.remove(user_id)
+            response_text = "You left the giveaway."
+        else:
+            self.entries.add(user_id)
+            response_text = "You entered the giveaway. Good luck!"
+
+        await interaction.response.edit_message(
+            embed=self.build_embed(),
+            view=self,
+        )
+
+        await interaction.followup.send(
+            response_text,
+            ephemeral=True,
+        )
+
+    async def start_countdown(self) -> None:
+        if self.countdown_task is None:
+            self.countdown_task = asyncio.create_task(
+                self.countdown_loop()
+            )
+
+    async def countdown_loop(self) -> None:
+        try:
+            while not self.finished and self.seconds_remaining > 0:
+                interval = min(
+                    countdown_update_interval(
+                        self.seconds_remaining
+                    ),
+                    self.seconds_remaining,
+                )
+
+                await asyncio.sleep(interval)
+                self.seconds_remaining = max(
+                    0,
+                    self.seconds_remaining - interval,
+                )
+
+                if self.finished:
+                    return
+
+                if self.seconds_remaining == 0:
+                    await self.finish_giveaway()
+                    return
+
+                if self.message is not None:
+                    try:
+                        await self.message.edit(
+                            embed=self.build_embed(),
+                            view=self,
+                        )
+                    except discord.HTTPException:
+                        logger.exception(
+                            "Failed to update giveaway timer."
+                        )
+
+        except asyncio.CancelledError:
+            return
+
+    async def select_winners(
+        self,
+    ) -> list[discord.Member]:
+        if self.message is None or self.message.guild is None:
+            return []
+
+        eligible_members = []
+
+        for user_id in self.entries:
+            member = self.message.guild.get_member(user_id)
+
+            if member is None or member.bot:
+                continue
+
+            if (
+                self.required_role is not None
+                and self.required_role not in member.roles
+            ):
+                continue
+
+            eligible_members.append(member)
+
+        if not eligible_members:
+            return []
+
+        amount = min(
+            self.winner_count,
+            len(eligible_members),
+        )
+
+        return random.sample(
+            eligible_members,
+            k=amount,
+        )
+
+    async def finish_giveaway(
+        self,
+        ended_early: bool = False,
+    ) -> None:
+        if self.finished:
+            return
+
+        self.finished = True
+        self.seconds_remaining = 0
+        self.stop()
+
+        if (
+            self.countdown_task is not None
+            and self.countdown_task is not asyncio.current_task()
+        ):
+            self.countdown_task.cancel()
+
+        self.last_winners = await self.select_winners()
+
+        for item in self.children:
+            if isinstance(item, GiveawayRerollButton):
+                item.disabled = not bool(self.entries)
+            else:
+                item.disabled = True
+
+        if self.message is None:
+            return
+
+        try:
+            await self.message.edit(
+                embed=self.build_embed(
+                    final=True,
+                    ended_early=ended_early,
+                ),
+                view=self,
+            )
+
+            if self.last_winners:
+                winner_mentions = ", ".join(
+                    winner.mention
+                    for winner in self.last_winners
+                )
+
+                await self.message.reply(
+                    f"🎉 Congratulations {winner_mentions}! "
+                    f"You won **{self.prize}**!",
+                    allowed_mentions=discord.AllowedMentions(
+                        users=True,
+                        roles=False,
+                        everyone=False,
+                    ),
+                )
+
+        except discord.HTTPException:
+            logger.exception(
+                "Failed to close a giveaway."
+            )
+
+    async def on_timeout(self):
+        await self.finish_giveaway()
+
+
+# =========================================================
 # SLASH COMMANDS
 # =========================================================
+
+@bot.tree.command(
+    name="giveaway",
+    description="Create a timed giveaway with automatic winners.",
+)
+@app_commands.describe(
+    prize="The prize being given away.",
+    winners="How many winners to select.",
+    duration="How long the giveaway lasts, from 15 to 86400 seconds.",
+    required_role="Optional role members must have to enter.",
+)
+async def giveaway(
+    interaction: discord.Interaction,
+    prize: app_commands.Range[str, 1, 200],
+    winners: app_commands.Range[int, 1, 20] = 1,
+    duration: app_commands.Range[int, 15, 86400] = 300,
+    required_role: discord.Role | None = None,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    permissions = getattr(
+        interaction.user,
+        "guild_permissions",
+        None,
+    )
+
+    if not permissions or not permissions.manage_messages:
+        await interaction.response.send_message(
+            "You need **Manage Messages** to create giveaways.",
+            ephemeral=True,
+        )
+        return
+
+    if required_role is not None and required_role.is_default():
+        required_role = None
+
+    view = GiveawayView(
+        prize=prize.strip(),
+        creator=interaction.user,
+        winner_count=winners,
+        duration_seconds=duration,
+        required_role=required_role,
+    )
+
+    await interaction.response.send_message(
+        embed=view.build_embed(),
+        view=view,
+    )
+
+    view.message = await interaction.original_response()
+    await view.start_countdown()
+
 
 @bot.tree.command(
     name="suggest",
