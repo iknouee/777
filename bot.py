@@ -1457,8 +1457,428 @@ class SmashOrPassView(discord.ui.View):
 
 
 # =========================================================
+# POLLS
+# =========================================================
+
+class PollOptionButton(discord.ui.Button):
+    def __init__(
+        self,
+        option_index: int,
+        option_text: str,
+        row: int,
+    ):
+        super().__init__(
+            label=option_text[:80],
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"777_poll_option_{option_index}",
+            row=row,
+        )
+
+        self.option_index = option_index
+
+    async def callback(
+        self,
+        interaction: discord.Interaction,
+    ):
+        view = self.view
+
+        if not isinstance(view, PollView):
+            await interaction.response.send_message(
+                "This poll is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        await view.cast_vote(
+            interaction,
+            self.option_index,
+        )
+
+
+class EndPollButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="End Poll",
+            emoji="🛑",
+            style=discord.ButtonStyle.danger,
+            row=4,
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction,
+    ):
+        view = self.view
+
+        if not isinstance(view, PollView):
+            await interaction.response.send_message(
+                "This poll is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        if interaction.user.id != view.creator.id:
+            permissions = getattr(
+                interaction.user,
+                "guild_permissions",
+                None,
+            )
+
+            if not permissions or not permissions.manage_messages:
+                await interaction.response.send_message(
+                    "Only the poll creator or a moderator can end this poll.",
+                    ephemeral=True,
+                )
+                return
+
+        await interaction.response.defer(ephemeral=True)
+        await view.finish_poll(ended_early=True)
+
+        await interaction.followup.send(
+            "The poll has been ended.",
+            ephemeral=True,
+        )
+
+
+class PollView(discord.ui.View):
+    def __init__(
+        self,
+        question: str,
+        options: list[str],
+        creator: discord.Member | discord.User,
+        duration_seconds: int,
+        anonymous: bool,
+    ):
+        super().__init__(timeout=duration_seconds)
+
+        self.question = question
+        self.options = options
+        self.creator = creator
+        self.duration_seconds = duration_seconds
+        self.anonymous = anonymous
+
+        self.votes: dict[int, int] = {}
+        self.message: discord.Message | None = None
+        self.finished = False
+
+        for index, option in enumerate(options):
+            self.add_item(
+                PollOptionButton(
+                    option_index=index,
+                    option_text=option,
+                    row=index // 2,
+                )
+            )
+
+        self.add_item(EndPollButton())
+
+    def vote_counts(self) -> list[int]:
+        counts = [0 for _ in self.options]
+
+        for option_index in self.votes.values():
+            if 0 <= option_index < len(counts):
+                counts[option_index] += 1
+
+        return counts
+
+    def results_text(self) -> str:
+        counts = self.vote_counts()
+        total_votes = len(self.votes)
+        lines = []
+
+        number_emojis = [
+            "1️⃣",
+            "2️⃣",
+            "3️⃣",
+            "4️⃣",
+            "5️⃣",
+        ]
+
+        for index, option in enumerate(self.options):
+            count = counts[index]
+
+            percentage = (
+                round(count / total_votes * 100)
+                if total_votes > 0
+                else 0
+            )
+
+            lines.append(
+                f"{number_emojis[index]} **{option}**\n"
+                f"`{count}` vote{'s' if count != 1 else ''} • "
+                f"`{percentage}%`"
+            )
+
+        return "\n\n".join(lines)
+
+    def winner_text(self) -> str:
+        counts = self.vote_counts()
+        total_votes = len(self.votes)
+
+        if total_votes == 0:
+            return "No votes were cast."
+
+        highest_count = max(counts)
+
+        winners = [
+            self.options[index]
+            for index, count in enumerate(counts)
+            if count == highest_count
+        ]
+
+        if len(winners) == 1:
+            return f"🏆 **Winner:** {winners[0]}"
+
+        joined_winners = ", ".join(winners)
+
+        return f"⚖️ **Tie:** {joined_winners}"
+
+    def build_embed(
+        self,
+        final: bool = False,
+        ended_early: bool = False,
+    ) -> discord.Embed:
+        if final:
+            title = "📊 Poll Results"
+            ending_note = (
+                "The poll was ended early."
+                if ended_early
+                else "Voting has ended."
+            )
+
+            description = (
+                f"**{self.question}**\n\n"
+                f"{ending_note}\n"
+                f"{self.winner_text()}"
+            )
+
+        else:
+            title = "📊 777 Poll"
+            description = (
+                f"**{self.question}**\n\n"
+                "Choose one option below. "
+                "You can change your vote while the poll is open."
+            )
+
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            colour=GOLD_COLOUR,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        embed.add_field(
+            name="Results" if final else "Live Results",
+            value=self.results_text(),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Votes",
+            value=f"`{len(self.votes)}`",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Created By",
+            value=self.creator.mention,
+            inline=True,
+        )
+
+        if not final:
+            embed.add_field(
+                name="Time",
+                value=f"`{self.duration_seconds} seconds`",
+                inline=True,
+            )
+
+        embed.add_field(
+            name="Voting",
+            value=(
+                "Anonymous"
+                if self.anonymous
+                else "Private vote confirmations"
+            ),
+            inline=True,
+        )
+
+        embed.set_footer(
+            text=(
+                "777 • Poll open"
+                if not final
+                else "777 • Poll closed"
+            )
+        )
+
+        return embed
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.bot:
+            await interaction.response.send_message(
+                "Bots cannot vote.",
+                ephemeral=True,
+            )
+            return False
+
+        if self.finished:
+            await interaction.response.send_message(
+                "This poll has already ended.",
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+    async def cast_vote(
+        self,
+        interaction: discord.Interaction,
+        option_index: int,
+    ) -> None:
+        previous_vote = self.votes.get(
+            interaction.user.id
+        )
+
+        self.votes[interaction.user.id] = option_index
+
+        selected_option = self.options[option_index]
+
+        await interaction.response.edit_message(
+            embed=self.build_embed(),
+            view=self,
+        )
+
+        if previous_vote is None:
+            confirmation = (
+                f"Your vote for **{selected_option}** was recorded."
+            )
+
+        elif previous_vote == option_index:
+            confirmation = (
+                f"Your vote is still **{selected_option}**."
+            )
+
+        else:
+            confirmation = (
+                f"Your vote was changed to **{selected_option}**."
+            )
+
+        await interaction.followup.send(
+            confirmation,
+            ephemeral=True,
+        )
+
+    async def finish_poll(
+        self,
+        ended_early: bool = False,
+    ) -> None:
+        if self.finished:
+            return
+
+        self.finished = True
+        self.stop()
+
+        for item in self.children:
+            item.disabled = True
+
+        if self.message is None:
+            return
+
+        try:
+            await self.message.edit(
+                embed=self.build_embed(
+                    final=True,
+                    ended_early=ended_early,
+                ),
+                view=self,
+            )
+
+        except discord.HTTPException:
+            logger.exception(
+                "Failed to close a poll."
+            )
+
+    async def on_timeout(self):
+        await self.finish_poll()
+
+
+# =========================================================
 # SLASH COMMANDS
 # =========================================================
+
+@bot.tree.command(
+    name="poll",
+    description="Create a button poll with up to five options.",
+)
+@app_commands.describe(
+    question="The question people will vote on.",
+    option1="The first option.",
+    option2="The second option.",
+    option3="Optional third option.",
+    option4="Optional fourth option.",
+    option5="Optional fifth option.",
+    duration="How long voting stays open, from 15 to 3600 seconds.",
+    anonymous="Whether voter choices should remain anonymous.",
+)
+async def poll(
+    interaction: discord.Interaction,
+    question: app_commands.Range[str, 1, 200],
+    option1: app_commands.Range[str, 1, 80],
+    option2: app_commands.Range[str, 1, 80],
+    option3: app_commands.Range[str, 1, 80] | None = None,
+    option4: app_commands.Range[str, 1, 80] | None = None,
+    option5: app_commands.Range[str, 1, 80] | None = None,
+    duration: app_commands.Range[int, 15, 3600] = 60,
+    anonymous: bool = True,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    options = [
+        option
+        for option in [
+            option1,
+            option2,
+            option3,
+            option4,
+            option5,
+        ]
+        if option is not None
+    ]
+
+    normalized_options = [
+        option.strip().casefold()
+        for option in options
+    ]
+
+    if len(set(normalized_options)) != len(options):
+        await interaction.response.send_message(
+            "Every poll option must be different.",
+            ephemeral=True,
+        )
+        return
+
+    view = PollView(
+        question=question.strip(),
+        options=[option.strip() for option in options],
+        creator=interaction.user,
+        duration_seconds=duration,
+        anonymous=anonymous,
+    )
+
+    await interaction.response.send_message(
+        embed=view.build_embed(),
+        view=view,
+    )
+
+    view.message = await interaction.original_response()
+
 
 @bot.tree.command(
     name="smash_or_pass",
@@ -1535,91 +1955,6 @@ async def ping(
 
     await interaction.response.send_message(embed=embed)
 
-
-@bot.tree.command(
-    name="about",
-    description="Learn more about the 777 bot.",
-)
-async def about(
-    interaction: discord.Interaction,
-):
-    embed = discord.Embed(
-        title="✦ 777 Bot ✦",
-        description=(
-            "A custom community bot made for the "
-            "**777 Roblox friend group**."
-        ),
-        colour=GOLD_COLOUR,
-        timestamp=datetime.now(timezone.utc),
-    )
-
-    if BANNER_URL:
-        embed.set_image(url=BANNER_URL)
-
-    embed.add_field(
-        name="Current Features",
-        value=(
-            "• Welcome and goodbye messages\n"
-            "• Quote image generator\n"
-            "• Right-click message quoting\n"
-            "• Right-click message clipping\n"
-            "• `/clip` message-link command\n"
-            "• Smash or Pass button voting\n"
-            "• Counting channel with streak tracking\n"
-            "• `/counting`\n"
-            "• `/ping`\n"
-            "• `/about`"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="Quote Commands",
-        value=(
-            "Right-click a message and select:\n"
-            "**Apps → Make it a Quote**\n\n"
-            "You can also use `/quote` with a message link "
-            "or reply with `!quote`."
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="Clipped Messages",
-        value=(
-            "Right-click a funny or memorable message and select:\n"
-            "**Apps → Clip Message**\n\n"
-            "777 will save it in the configured clips channel."
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="Smash or Pass",
-        value=(
-            "Use `/smash_or_pass` and choose a server member.\n"
-            "Members vote with **🔥 Smash** or **❌ Pass** buttons, "
-            "and the final percentages appear when voting ends."
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="Counting Rules",
-        value=(
-            "• Count upward one number at a time\n"
-            "• You cannot count twice in a row\n"
-            "• A wrong number resets the streak\n"
-            "• Use `/counting` to view the current record"
-        ),
-        inline=False,
-    )
-
-    embed.set_footer(
-        text="Made for the 777 friend group"
-    )
-
-    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(
