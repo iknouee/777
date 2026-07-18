@@ -9,7 +9,7 @@ import sqlite3
 import time
 import textwrap
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import discord
@@ -924,6 +924,8 @@ async def on_ready():
 async def on_member_join(
     member: discord.Member,
 ):
+    await security_check_join(member)
+
     channel = get_welcome_channel(member.guild)
 
     if channel is None:
@@ -1077,6 +1079,9 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
     if message.guild is None:
+        return
+
+    if await security_check_message(message):
         return
 
     counting_channel_id = configured_counting_channel_id()
@@ -5577,6 +5582,1028 @@ def perform_economy_minigame(
 
 initialize_full_economy_tables()
 
+
+# =========================================================
+# ECONOMY POLISH, ADMIN TOOLS, ITEM EFFECTS, AUDIT & HELP
+# =========================================================
+
+ECONOMY_MAX_TRANSFER = int(
+    os.getenv("ECONOMY_MAX_TRANSFER", "1000000")
+)
+ECONOMY_MAX_BALANCE = int(
+    os.getenv("ECONOMY_MAX_BALANCE", "9000000000000000")
+)
+ECONOMY_ADMIN_LOG_CHANNEL_ID = os.getenv(
+    "ECONOMY_ADMIN_LOG_CHANNEL_ID"
+)
+
+HELP_CATEGORIES = {
+    "Community": [
+        "/quote", "/clip", "/counting", "/smash_or_pass",
+        "/poll", "/suggest", "/giveaway",
+    ],
+    "Economy": [
+        "/balance", "/daily", "/work", "/deposit",
+        "/withdraw", "/pay", "/leaderboard", "/profile",
+        "/stats", "/achievements", "/prestige",
+    ],
+    "Casino": [
+        "/slots", "/blackjack", "/roulette",
+    ],
+    "Shop": [
+        "/shop", "/buy", "/inventory", "/use", "/sell",
+    ],
+    "Activities": [
+        "/fish", "/mine", "/hunt", "/crime", "/heist",
+    ],
+    "Moderation": [
+        "/ban", "/unban", "/kick", "/timeout", "/untimeout",
+        "/warn", "/warnings", "/clear_warnings", "/purge",
+        "/lock", "/unlock", "/slowmode", "/security_status",
+    ],
+    "Admin": [
+        "/economy_add", "/economy_remove", "/economy_set",
+        "/economy_reset", "/economy_lookup", "/economy_rollback",
+    ],
+}
+
+
+def initialize_polish_tables() -> None:
+    with economy_lock, economy_connection() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS economy_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                actor_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                amount INTEGER,
+                previous_wallet INTEGER,
+                new_wallet INTEGER,
+                reason TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS economy_effects (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                effect_key TEXT NOT NULL,
+                value REAL NOT NULL DEFAULT 0,
+                expires_at INTEGER,
+                PRIMARY KEY (guild_id, user_id, effect_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS economy_game_stats (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                total_wagered INTEGER NOT NULL DEFAULT 0,
+                total_payout INTEGER NOT NULL DEFAULT 0,
+                biggest_bet INTEGER NOT NULL DEFAULT 0,
+                biggest_jackpot INTEGER NOT NULL DEFAULT 0,
+                slots_spins INTEGER NOT NULL DEFAULT 0,
+                blackjack_games INTEGER NOT NULL DEFAULT 0,
+                blackjack_pushes INTEGER NOT NULL DEFAULT 0,
+                roulette_spins INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            );
+            """
+        )
+
+
+def clamp_balance(value: int) -> int:
+    return max(0, min(int(value), ECONOMY_MAX_BALANCE))
+
+
+def ensure_game_stats(guild_id: int, user_id: int) -> None:
+    with economy_lock, economy_connection() as connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO economy_game_stats (
+                guild_id, user_id
+            )
+            VALUES (?, ?)
+            """,
+            (guild_id, user_id),
+        )
+
+
+def update_detailed_game_stats(
+    guild_id: int,
+    user_id: int,
+    game: str,
+    bet: int,
+    payout: int,
+    jackpot: bool = False,
+    push: bool = False,
+) -> None:
+    ensure_game_stats(guild_id, user_id)
+
+    game_column = {
+        "slots": "slots_spins",
+        "blackjack": "blackjack_games",
+        "roulette": "roulette_spins",
+    }.get(game)
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+
+        if game_column:
+            connection.execute(
+                f"""
+                UPDATE economy_game_stats
+                SET total_wagered = total_wagered + ?,
+                    total_payout = total_payout + ?,
+                    biggest_bet = MAX(biggest_bet, ?),
+                    biggest_jackpot = MAX(
+                        biggest_jackpot,
+                        ?
+                    ),
+                    {game_column} = {game_column} + 1,
+                    blackjack_pushes = blackjack_pushes + ?
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (
+                    max(0, bet),
+                    max(0, payout),
+                    max(0, bet),
+                    max(0, payout if jackpot else 0),
+                    1 if push else 0,
+                    guild_id,
+                    user_id,
+                ),
+            )
+
+        connection.commit()
+
+
+def get_detailed_game_stats(
+    guild_id: int,
+    user_id: int,
+) -> dict:
+    ensure_game_stats(guild_id, user_id)
+
+    with economy_lock, economy_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM economy_game_stats
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+    return dict(row)
+
+
+def set_effect(
+    guild_id: int,
+    user_id: int,
+    effect_key: str,
+    value: float,
+    duration_seconds: int | None,
+) -> None:
+    expires_at = (
+        int(time.time()) + duration_seconds
+        if duration_seconds
+        else None
+    )
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO economy_effects (
+                guild_id, user_id, effect_key, value, expires_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, user_id, effect_key)
+            DO UPDATE SET
+                value = excluded.value,
+                expires_at = excluded.expires_at
+            """,
+            (
+                guild_id,
+                user_id,
+                effect_key,
+                value,
+                expires_at,
+            ),
+        )
+        connection.commit()
+
+
+def get_effect(
+    guild_id: int,
+    user_id: int,
+    effect_key: str,
+) -> float:
+    now = int(time.time())
+
+    with economy_lock, economy_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT value, expires_at
+            FROM economy_effects
+            WHERE guild_id = ? AND user_id = ? AND effect_key = ?
+            """,
+            (guild_id, user_id, effect_key),
+        ).fetchone()
+
+        if not row:
+            return 0.0
+
+        if row["expires_at"] and row["expires_at"] <= now:
+            connection.execute(
+                """
+                DELETE FROM economy_effects
+                WHERE guild_id = ? AND user_id = ? AND effect_key = ?
+                """,
+                (guild_id, user_id, effect_key),
+            )
+            connection.commit()
+            return 0.0
+
+        return float(row["value"])
+
+
+def record_admin_audit(
+    guild_id: int,
+    actor_id: int,
+    target_id: int,
+    action: str,
+    amount: int | None,
+    previous_wallet: int | None,
+    new_wallet: int | None,
+    reason: str,
+) -> int:
+    with economy_lock, economy_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO economy_audit_log (
+                guild_id, actor_id, target_id, action,
+                amount, previous_wallet, new_wallet,
+                reason, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                guild_id,
+                actor_id,
+                target_id,
+                action,
+                amount,
+                previous_wallet,
+                new_wallet,
+                reason[:500],
+                int(time.time()),
+            ),
+        )
+        connection.commit()
+        return int(cursor.lastrowid)
+
+
+def get_audit_entry(
+    guild_id: int,
+    audit_id: int,
+) -> dict | None:
+    with economy_lock, economy_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM economy_audit_log
+            WHERE guild_id = ? AND id = ?
+            """,
+            (guild_id, audit_id),
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def admin_set_wallet(
+    guild_id: int,
+    user_id: int,
+    new_wallet: int,
+) -> tuple[int, int]:
+    ensure_economy_user(guild_id, user_id)
+    new_wallet = clamp_balance(new_wallet)
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            """
+            SELECT wallet
+            FROM economy_users
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+        previous = int(row["wallet"])
+
+        connection.execute(
+            """
+            UPDATE economy_users
+            SET wallet = ?
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (new_wallet, guild_id, user_id),
+        )
+        connection.commit()
+
+    return previous, new_wallet
+
+
+async def send_economy_audit_embed(
+    guild: discord.Guild,
+    actor: discord.abc.User,
+    target: discord.abc.User,
+    action: str,
+    amount: int | None,
+    previous: int | None,
+    new: int | None,
+    reason: str,
+    audit_id: int,
+) -> None:
+    if not ECONOMY_ADMIN_LOG_CHANNEL_ID:
+        return
+
+    try:
+        channel_id = int(ECONOMY_ADMIN_LOG_CHANNEL_ID)
+    except ValueError:
+        return
+
+    channel = guild.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    embed = discord.Embed(
+        title="🧾 Economy Admin Audit",
+        colour=GOLD_COLOUR,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Audit ID", value=f"`{audit_id}`", inline=True)
+    embed.add_field(name="Action", value=action, inline=True)
+    embed.add_field(name="Actor", value=actor.mention, inline=True)
+    embed.add_field(name="Target", value=target.mention, inline=True)
+
+    if amount is not None:
+        embed.add_field(
+            name="Amount",
+            value=format_coins(amount),
+            inline=True,
+        )
+
+    if previous is not None and new is not None:
+        embed.add_field(
+            name="Wallet Change",
+            value=f"{format_coins(previous)} → {format_coins(new)}",
+            inline=False,
+        )
+
+    embed.add_field(
+        name="Reason",
+        value=reason or "No reason supplied.",
+        inline=False,
+    )
+
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        logger.exception("Failed to send economy audit log.")
+
+
+def is_economy_admin(
+    interaction: discord.Interaction,
+) -> bool:
+    if not isinstance(interaction.user, discord.Member):
+        return False
+
+    return (
+        interaction.user.guild_permissions.administrator
+        or interaction.user.guild_permissions.manage_guild
+    )
+
+
+async def require_economy_admin(
+    interaction: discord.Interaction,
+) -> bool:
+    if is_economy_admin(interaction):
+        return True
+
+    await interaction.response.send_message(
+        "You need Administrator or Manage Server permission.",
+        ephemeral=True,
+    )
+    return False
+
+
+class HelpCategorySelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label=name,
+                description=f"View {name.lower()} commands.",
+            )
+            for name in HELP_CATEGORIES
+        ]
+
+        super().__init__(
+            placeholder="Choose a help category...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction,
+    ):
+        category = self.values[0]
+        commands = HELP_CATEGORIES[category]
+
+        embed = discord.Embed(
+            title=f"777 Help • {category}",
+            description="\n".join(
+                f"• `{command}`" for command in commands
+            ),
+            colour=GOLD_COLOUR,
+        )
+        embed.set_footer(
+            text="Use Discord's slash-command picker for full options."
+        )
+
+        await interaction.response.edit_message(
+            embed=embed,
+            view=self.view,
+        )
+
+
+class HelpView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.add_item(HelpCategorySelect())
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Open your own `/help` menu to use it.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+
+initialize_polish_tables()
+
+
+# =========================================================
+# MODERATION & SERVER SECURITY
+# =========================================================
+
+MOD_LOG_CHANNEL_ID = os.getenv("MOD_LOG_CHANNEL_ID")
+SECURITY_ALERT_CHANNEL_ID = os.getenv(
+    "SECURITY_ALERT_CHANNEL_ID",
+    MOD_LOG_CHANNEL_ID or "",
+)
+
+ANTI_SPAM_ENABLED = (
+    os.getenv("ANTI_SPAM_ENABLED", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+ANTI_SPAM_MESSAGE_LIMIT = max(
+    3,
+    int(os.getenv("ANTI_SPAM_MESSAGE_LIMIT", "6")),
+)
+ANTI_SPAM_WINDOW_SECONDS = max(
+    2,
+    int(os.getenv("ANTI_SPAM_WINDOW_SECONDS", "8")),
+)
+ANTI_SPAM_TIMEOUT_MINUTES = max(
+    1,
+    int(os.getenv("ANTI_SPAM_TIMEOUT_MINUTES", "5")),
+)
+
+ANTI_RAID_ENABLED = (
+    os.getenv("ANTI_RAID_ENABLED", "true").lower()
+    in {"1", "true", "yes", "on"}
+)
+ANTI_RAID_JOIN_LIMIT = max(
+    3,
+    int(os.getenv("ANTI_RAID_JOIN_LIMIT", "8")),
+)
+ANTI_RAID_WINDOW_SECONDS = max(
+    5,
+    int(os.getenv("ANTI_RAID_WINDOW_SECONDS", "20")),
+)
+ANTI_RAID_ACCOUNT_AGE_HOURS = max(
+    0,
+    int(os.getenv("ANTI_RAID_ACCOUNT_AGE_HOURS", "24")),
+)
+ANTI_RAID_AUTO_TIMEOUT = (
+    os.getenv("ANTI_RAID_AUTO_TIMEOUT", "false").lower()
+    in {"1", "true", "yes", "on"}
+)
+
+_security_message_history: dict[
+    tuple[int, int],
+    list[float],
+] = {}
+_security_join_history: dict[int, list[float]] = {}
+_security_alert_cooldowns: dict[tuple[int, str], float] = {}
+
+
+def initialize_security_tables() -> None:
+    with economy_lock, economy_connection() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS moderation_warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                moderator_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS moderation_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                moderator_id INTEGER NOT NULL,
+                target_id INTEGER,
+                action TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                duration_seconds INTEGER,
+                created_at INTEGER NOT NULL
+            );
+            """
+        )
+
+
+def configured_channel(
+    guild: discord.Guild,
+    raw_id: str | None,
+) -> discord.TextChannel | None:
+    if not raw_id:
+        return None
+
+    try:
+        channel_id = int(raw_id)
+    except ValueError:
+        return None
+
+    channel = guild.get_channel(channel_id)
+    return (
+        channel
+        if isinstance(channel, discord.TextChannel)
+        else None
+    )
+
+
+def member_is_moderator(member: discord.Member) -> bool:
+    permissions = member.guild_permissions
+    return any(
+        (
+            permissions.administrator,
+            permissions.manage_guild,
+            permissions.moderate_members,
+            permissions.kick_members,
+            permissions.ban_members,
+            permissions.manage_messages,
+        )
+    )
+
+
+def bot_can_act_on(
+    guild: discord.Guild,
+    target: discord.Member,
+) -> tuple[bool, str]:
+    bot_member = guild.me
+
+    if bot_member is None:
+        return False, "The bot member could not be resolved."
+
+    if target.id == guild.owner_id:
+        return False, "The server owner cannot be moderated."
+
+    if target.top_role >= bot_member.top_role:
+        return (
+            False,
+            "My highest role must be above the target member's highest role.",
+        )
+
+    return True, ""
+
+
+def moderator_can_act_on(
+    moderator: discord.Member,
+    target: discord.Member,
+) -> tuple[bool, str]:
+    if moderator.id == target.id:
+        return False, "You cannot moderate yourself."
+
+    if target.id == moderator.guild.owner_id:
+        return False, "The server owner cannot be moderated."
+
+    if (
+        moderator.id != moderator.guild.owner_id
+        and target.top_role >= moderator.top_role
+    ):
+        return (
+            False,
+            "Your highest role must be above the target member's highest role.",
+        )
+
+    return True, ""
+
+
+async def moderation_precheck(
+    interaction: discord.Interaction,
+    target: discord.Member,
+) -> bool:
+    if interaction.guild is None or not isinstance(
+        interaction.user,
+        discord.Member,
+    ):
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return False
+
+    allowed, reason = moderator_can_act_on(
+        interaction.user,
+        target,
+    )
+    if not allowed:
+        await interaction.response.send_message(
+            reason,
+            ephemeral=True,
+        )
+        return False
+
+    allowed, reason = bot_can_act_on(
+        interaction.guild,
+        target,
+    )
+    if not allowed:
+        await interaction.response.send_message(
+            reason,
+            ephemeral=True,
+        )
+        return False
+
+    return True
+
+
+def record_moderation_action(
+    guild_id: int,
+    moderator_id: int,
+    target_id: int | None,
+    action: str,
+    reason: str,
+    duration_seconds: int | None = None,
+) -> int:
+    with economy_lock, economy_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO moderation_actions (
+                guild_id, moderator_id, target_id,
+                action, reason, duration_seconds, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                guild_id,
+                moderator_id,
+                target_id,
+                action,
+                reason[:1000],
+                duration_seconds,
+                int(time.time()),
+            ),
+        )
+        connection.commit()
+        return int(cursor.lastrowid)
+
+
+async def send_mod_log(
+    guild: discord.Guild,
+    action: str,
+    moderator: discord.abc.User | None,
+    target: discord.abc.User | None,
+    reason: str,
+    case_id: int | None = None,
+    duration: str | None = None,
+    extra: str | None = None,
+) -> None:
+    channel = configured_channel(
+        guild,
+        MOD_LOG_CHANNEL_ID,
+    )
+    if channel is None:
+        return
+
+    embed = discord.Embed(
+        title=f"🛡️ {action}",
+        colour=GOLD_COLOUR,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    if case_id is not None:
+        embed.add_field(
+            name="Case",
+            value=f"`{case_id}`",
+            inline=True,
+        )
+
+    if moderator is not None:
+        embed.add_field(
+            name="Moderator",
+            value=f"{moderator.mention} (`{moderator.id}`)",
+            inline=True,
+        )
+
+    if target is not None:
+        embed.add_field(
+            name="Target",
+            value=f"{target.mention} (`{target.id}`)",
+            inline=True,
+        )
+
+    if duration:
+        embed.add_field(
+            name="Duration",
+            value=duration,
+            inline=True,
+        )
+
+    embed.add_field(
+        name="Reason",
+        value=reason or "No reason provided.",
+        inline=False,
+    )
+
+    if extra:
+        embed.add_field(
+            name="Details",
+            value=extra,
+            inline=False,
+        )
+
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        logger.exception("Failed to send moderation log.")
+
+
+async def send_security_alert(
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    alert_key: str,
+    cooldown: int = 30,
+) -> None:
+    now = time.monotonic()
+    key = (guild.id, alert_key)
+
+    if now - _security_alert_cooldowns.get(key, 0) < cooldown:
+        return
+
+    _security_alert_cooldowns[key] = now
+
+    channel = configured_channel(
+        guild,
+        SECURITY_ALERT_CHANNEL_ID,
+    )
+    if channel is None:
+        return
+
+    embed = discord.Embed(
+        title=f"🚨 {title}",
+        description=description,
+        colour=discord.Colour.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        logger.exception("Failed to send security alert.")
+
+
+async def security_check_message(
+    message: discord.Message,
+) -> bool:
+    if (
+        not ANTI_SPAM_ENABLED
+        or message.guild is None
+        or not isinstance(message.author, discord.Member)
+        or member_is_moderator(message.author)
+    ):
+        return False
+
+    now = time.monotonic()
+    key = (message.guild.id, message.author.id)
+    history = _security_message_history.setdefault(key, [])
+    cutoff = now - ANTI_SPAM_WINDOW_SECONDS
+
+    history[:] = [
+        timestamp
+        for timestamp in history
+        if timestamp >= cutoff
+    ]
+    history.append(now)
+
+    if len(history) < ANTI_SPAM_MESSAGE_LIMIT:
+        return False
+
+    history.clear()
+
+    try:
+        await message.delete()
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    timeout_until = discord.utils.utcnow() + timedelta(
+        minutes=ANTI_SPAM_TIMEOUT_MINUTES
+    )
+
+    action_taken = "messages flagged"
+
+    try:
+        can_act, _ = bot_can_act_on(
+            message.guild,
+            message.author,
+        )
+        if can_act:
+            await message.author.timeout(
+                timeout_until,
+                reason="777 anti-spam protection",
+            )
+            action_taken = (
+                f"timed out for {ANTI_SPAM_TIMEOUT_MINUTES} minutes"
+            )
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception("Anti-spam timeout failed.")
+
+    await send_security_alert(
+        message.guild,
+        "Anti-Spam Triggered",
+        (
+            f"{message.author.mention} sent at least "
+            f"**{ANTI_SPAM_MESSAGE_LIMIT} messages** within "
+            f"**{ANTI_SPAM_WINDOW_SECONDS} seconds** and was "
+            f"{action_taken}."
+        ),
+        f"spam:{message.author.id}",
+    )
+
+    return True
+
+
+async def security_check_join(
+    member: discord.Member,
+) -> None:
+    if not ANTI_RAID_ENABLED:
+        return
+
+    now = time.monotonic()
+    history = _security_join_history.setdefault(
+        member.guild.id,
+        [],
+    )
+    cutoff = now - ANTI_RAID_WINDOW_SECONDS
+    history[:] = [
+        timestamp
+        for timestamp in history
+        if timestamp >= cutoff
+    ]
+    history.append(now)
+
+    account_age = (
+        discord.utils.utcnow() - member.created_at
+    )
+    young_account = (
+        account_age
+        < timedelta(hours=ANTI_RAID_ACCOUNT_AGE_HOURS)
+    )
+
+    if len(history) >= ANTI_RAID_JOIN_LIMIT:
+        await send_security_alert(
+            member.guild,
+            "Possible Join Raid",
+            (
+                f"Detected **{len(history)} joins** within "
+                f"**{ANTI_RAID_WINDOW_SECONDS} seconds**.\n"
+                f"Latest member: {member.mention} (`{member.id}`)"
+            ),
+            "join_raid",
+            cooldown=ANTI_RAID_WINDOW_SECONDS,
+        )
+
+    if young_account:
+        await send_security_alert(
+            member.guild,
+            "New Account Joined",
+            (
+                f"{member.mention}'s account is only "
+                f"{discord.utils.format_dt(member.created_at, style='R')} old."
+            ),
+            f"young:{member.id}",
+            cooldown=5,
+        )
+
+        if ANTI_RAID_AUTO_TIMEOUT:
+            can_act, _ = bot_can_act_on(
+                member.guild,
+                member,
+            )
+            if can_act:
+                try:
+                    await member.timeout(
+                        discord.utils.utcnow()
+                        + timedelta(minutes=10),
+                        reason="777 new-account security review",
+                    )
+                except (
+                    discord.Forbidden,
+                    discord.HTTPException,
+                ):
+                    logger.exception(
+                        "New-account timeout failed."
+                    )
+
+
+def add_warning(
+    guild_id: int,
+    user_id: int,
+    moderator_id: int,
+    reason: str,
+) -> int:
+    with economy_lock, economy_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO moderation_warnings (
+                guild_id, user_id, moderator_id,
+                reason, created_at, active
+            )
+            VALUES (?, ?, ?, ?, ?, 1)
+            """,
+            (
+                guild_id,
+                user_id,
+                moderator_id,
+                reason[:1000],
+                int(time.time()),
+            ),
+        )
+        connection.commit()
+        return int(cursor.lastrowid)
+
+
+def get_active_warnings(
+    guild_id: int,
+    user_id: int,
+) -> list[dict]:
+    with economy_lock, economy_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM moderation_warnings
+            WHERE guild_id = ? AND user_id = ? AND active = 1
+            ORDER BY created_at DESC
+            LIMIT 20
+            """,
+            (guild_id, user_id),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def clear_active_warnings(
+    guild_id: int,
+    user_id: int,
+) -> int:
+    with economy_lock, economy_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE moderation_warnings
+            SET active = 0
+            WHERE guild_id = ? AND user_id = ? AND active = 1
+            """,
+            (guild_id, user_id),
+        )
+        connection.commit()
+        return int(cursor.rowcount)
+
+
+initialize_security_tables()
+
 # =========================================================
 # SLASH COMMANDS
 # =========================================================
@@ -5868,6 +6895,14 @@ async def pay(
     if member.id == interaction.user.id:
         await interaction.response.send_message(
             "You cannot pay yourself.",
+            ephemeral=True,
+        )
+        return
+
+    if amount > ECONOMY_MAX_TRANSFER:
+        await interaction.response.send_message(
+            f"Transfers are limited to "
+            f"{format_coins(ECONOMY_MAX_TRANSFER)} per command.",
             ephemeral=True,
         )
         return
@@ -6177,35 +7212,113 @@ async def use_item(
         return
 
     if item == "golden_ticket":
-        reward = random.randint(500, 1500)
+        tier_roll = random.random()
+
+        if tier_roll < 0.02:
+            tier = "MYTHIC"
+            reward = random.randint(10000, 25000)
+        elif tier_roll < 0.12:
+            tier = "LEGENDARY"
+            reward = random.randint(3500, 9000)
+        elif tier_roll < 0.40:
+            tier = "RARE"
+            reward = random.randint(1500, 3500)
+        else:
+            tier = "COMMON"
+            reward = random.randint(500, 1500)
+
         _, wallet = await asyncio.to_thread(
             change_wallet,
             interaction.guild.id,
             interaction.user.id,
             reward,
             "golden_ticket",
+            f"tier={tier}",
         )
-        message = f"🎟️ Your ticket paid **{format_coins(reward)}**. Wallet: {format_coins(wallet)}"
+        message = (
+            f"🎟️ **{tier} Golden Ticket!** "
+            f"You won **{format_coins(reward)}**. "
+            f"Wallet: {format_coins(wallet)}"
+        )
 
     elif item == "xp_boost":
-        xp, level = await asyncio.to_thread(
-            add_xp,
+        await asyncio.to_thread(
+            set_effect,
             interaction.guild.id,
             interaction.user.id,
-            500,
+            "xp_multiplier",
+            2.0,
+            60 * 60,
         )
-        message = f"⚡ Gained **500 XP**. You are level **{level}**."
+        message = (
+            "⚡ **Double XP activated for one hour.**"
+        )
 
     elif item == "mystery_crate":
-        reward = random.randint(300, 3500)
+        await interaction.response.defer()
+
+        opening = discord.Embed(
+            title="📦 Opening Mystery Crate...",
+            description="`▰▱▱▱▱`",
+            colour=GOLD_COLOUR,
+        )
+        await interaction.edit_original_response(embed=opening)
+
+        for frame in [
+            "`▰▰▱▱▱`",
+            "`▰▰▰▱▱`",
+            "`▰▰▰▰▱`",
+            "`▰▰▰▰▰`",
+        ]:
+            await asyncio.sleep(0.45)
+            opening.description = frame
+            try:
+                await interaction.edit_original_response(
+                    embed=opening
+                )
+            except discord.HTTPException:
+                pass
+
+        roll = random.random()
+
+        if roll < 0.03:
+            reward = random.randint(15000, 40000)
+            rarity = "MYTHIC"
+        elif roll < 0.15:
+            reward = random.randint(5000, 12000)
+            rarity = "LEGENDARY"
+        elif roll < 0.45:
+            reward = random.randint(1800, 5000)
+            rarity = "RARE"
+        else:
+            reward = random.randint(400, 1800)
+            rarity = "COMMON"
+
         _, wallet = await asyncio.to_thread(
             change_wallet,
             interaction.guild.id,
             interaction.user.id,
             reward,
             "mystery_crate",
+            f"rarity={rarity}",
         )
-        message = f"📦 The crate contained **{format_coins(reward)}**. Wallet: {format_coins(wallet)}"
+
+        result_embed = discord.Embed(
+            title=f"📦 {rarity} Crate Reward",
+            description=(
+                f"You found **{format_coins(reward)}**!"
+            ),
+            colour=GOLD_COLOUR,
+        )
+        result_embed.add_field(
+            name="Wallet",
+            value=format_coins(wallet),
+            inline=False,
+        )
+        await interaction.edit_original_response(
+            embed=result_embed
+        )
+        return
 
     else:
         message = "Item used."
@@ -6401,6 +7514,11 @@ async def stats(interaction: discord.Interaction):
         interaction.guild.id,
         interaction.user.id,
     )
+    detailed_stats = await asyncio.to_thread(
+        get_detailed_game_stats,
+        interaction.guild.id,
+        interaction.user.id,
+    )
 
     embed = discord.Embed(
         title="📈 777 Casino Statistics",
@@ -6412,6 +7530,48 @@ async def stats(interaction: discord.Interaction):
     embed.add_field(name="Blackjack Wins", value=str(stats_data["blackjack_wins"]), inline=True)
     embed.add_field(name="Roulette Wins", value=str(stats_data["roulette_wins"]), inline=True)
     embed.add_field(name="Biggest Win", value=format_coins(stats_data["biggest_win"]), inline=True)
+    embed.add_field(
+        name="Total Wagered",
+        value=format_coins(detailed_stats["total_wagered"]),
+        inline=True,
+    )
+    embed.add_field(
+        name="Total Payout",
+        value=format_coins(detailed_stats["total_payout"]),
+        inline=True,
+    )
+    net_casino = (
+        detailed_stats["total_payout"]
+        - detailed_stats["total_wagered"]
+    )
+    embed.add_field(
+        name="Casino Profit/Loss",
+        value=(
+            f"+{format_coins(net_casino)}"
+            if net_casino >= 0
+            else f"-{format_coins(abs(net_casino))}"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Biggest Bet",
+        value=format_coins(detailed_stats["biggest_bet"]),
+        inline=True,
+    )
+    embed.add_field(
+        name="Biggest Jackpot",
+        value=format_coins(detailed_stats["biggest_jackpot"]),
+        inline=True,
+    )
+    embed.add_field(
+        name="Games Played",
+        value=(
+            f"Slots: {detailed_stats['slots_spins']}\n"
+            f"Blackjack: {detailed_stats['blackjack_games']}\n"
+            f"Roulette: {detailed_stats['roulette_spins']}"
+        ),
+        inline=True,
+    )
 
     await interaction.response.send_message(embed=embed)
 
@@ -6518,6 +7678,1160 @@ async def prestige(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         "✨ **Prestige complete!** Your balance was reset and your prestige rank increased."
+    )
+
+
+@bot.tree.command(
+    name="help",
+    description="Open the interactive 777 command guide.",
+)
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="777 Help Centre",
+        description=(
+            "Choose a category below to browse commands.\n\n"
+            "The bot includes community tools, economy, casino games, "
+            "shop items, activities, giveaways, and staff controls."
+        ),
+        colour=GOLD_COLOUR,
+    )
+    embed.set_footer(text="777 • Interactive Help")
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=HelpView(interaction.user.id),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="economy_add",
+    description="Admin: add wallet coins to a member.",
+)
+async def economy_add(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    amount: app_commands.Range[int, 1, 1_000_000_000_000],
+    reason: str = "Administrative adjustment",
+):
+    if interaction.guild is None or not await require_economy_admin(interaction):
+        return
+
+    account = await asyncio.to_thread(
+        get_economy_account,
+        interaction.guild.id,
+        member.id,
+    )
+    previous = account["wallet"]
+    new_wallet = clamp_balance(previous + amount)
+
+    previous, new_wallet = await asyncio.to_thread(
+        admin_set_wallet,
+        interaction.guild.id,
+        member.id,
+        new_wallet,
+    )
+
+    audit_id = await asyncio.to_thread(
+        record_admin_audit,
+        interaction.guild.id,
+        interaction.user.id,
+        member.id,
+        "ADD",
+        amount,
+        previous,
+        new_wallet,
+        reason,
+    )
+
+    await interaction.response.send_message(
+        f"Added **{format_coins(amount)}** to {member.mention}.\n"
+        f"Wallet: **{format_coins(new_wallet)}**\n"
+        f"Audit ID: `{audit_id}`"
+    )
+
+    await send_economy_audit_embed(
+        interaction.guild,
+        interaction.user,
+        member,
+        "ADD",
+        amount,
+        previous,
+        new_wallet,
+        reason,
+        audit_id,
+    )
+
+
+@bot.tree.command(
+    name="economy_remove",
+    description="Admin: remove wallet coins from a member.",
+)
+async def economy_remove(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    amount: app_commands.Range[int, 1, 1_000_000_000_000],
+    reason: str = "Administrative adjustment",
+):
+    if interaction.guild is None or not await require_economy_admin(interaction):
+        return
+
+    account = await asyncio.to_thread(
+        get_economy_account,
+        interaction.guild.id,
+        member.id,
+    )
+    previous = account["wallet"]
+    new_wallet = max(0, previous - amount)
+
+    previous, new_wallet = await asyncio.to_thread(
+        admin_set_wallet,
+        interaction.guild.id,
+        member.id,
+        new_wallet,
+    )
+
+    audit_id = await asyncio.to_thread(
+        record_admin_audit,
+        interaction.guild.id,
+        interaction.user.id,
+        member.id,
+        "REMOVE",
+        amount,
+        previous,
+        new_wallet,
+        reason,
+    )
+
+    await interaction.response.send_message(
+        f"Removed up to **{format_coins(amount)}** from {member.mention}.\n"
+        f"Wallet: **{format_coins(new_wallet)}**\n"
+        f"Audit ID: `{audit_id}`"
+    )
+
+    await send_economy_audit_embed(
+        interaction.guild,
+        interaction.user,
+        member,
+        "REMOVE",
+        amount,
+        previous,
+        new_wallet,
+        reason,
+        audit_id,
+    )
+
+
+@bot.tree.command(
+    name="economy_set",
+    description="Admin: set a member's wallet balance.",
+)
+async def economy_set(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    amount: app_commands.Range[int, 0, 9_000_000_000_000_000],
+    reason: str = "Administrative adjustment",
+):
+    if interaction.guild is None or not await require_economy_admin(interaction):
+        return
+
+    previous, new_wallet = await asyncio.to_thread(
+        admin_set_wallet,
+        interaction.guild.id,
+        member.id,
+        amount,
+    )
+
+    audit_id = await asyncio.to_thread(
+        record_admin_audit,
+        interaction.guild.id,
+        interaction.user.id,
+        member.id,
+        "SET",
+        amount,
+        previous,
+        new_wallet,
+        reason,
+    )
+
+    await interaction.response.send_message(
+        f"Set {member.mention}'s wallet to "
+        f"**{format_coins(new_wallet)}**.\n"
+        f"Audit ID: `{audit_id}`"
+    )
+
+    await send_economy_audit_embed(
+        interaction.guild,
+        interaction.user,
+        member,
+        "SET",
+        amount,
+        previous,
+        new_wallet,
+        reason,
+        audit_id,
+    )
+
+
+@bot.tree.command(
+    name="economy_reset",
+    description="Admin: reset a member's wallet and bank.",
+)
+async def economy_reset(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "Administrative reset",
+):
+    if interaction.guild is None or not await require_economy_admin(interaction):
+        return
+
+    account = await asyncio.to_thread(
+        get_economy_account,
+        interaction.guild.id,
+        member.id,
+    )
+    previous = account["wallet"]
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute(
+            """
+            UPDATE economy_users
+            SET wallet = ?, bank = 0
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (
+                ECONOMY_STARTING_BALANCE,
+                interaction.guild.id,
+                member.id,
+            ),
+        )
+        connection.commit()
+
+    audit_id = await asyncio.to_thread(
+        record_admin_audit,
+        interaction.guild.id,
+        interaction.user.id,
+        member.id,
+        "RESET",
+        None,
+        previous,
+        ECONOMY_STARTING_BALANCE,
+        reason,
+    )
+
+    await interaction.response.send_message(
+        f"Reset {member.mention}'s economy account.\n"
+        f"Audit ID: `{audit_id}`"
+    )
+
+
+@bot.tree.command(
+    name="economy_lookup",
+    description="Admin: inspect a member's economy account.",
+)
+async def economy_lookup(
+    interaction: discord.Interaction,
+    member: discord.Member,
+):
+    if interaction.guild is None or not await require_economy_admin(interaction):
+        return
+
+    account = await asyncio.to_thread(
+        get_economy_account,
+        interaction.guild.id,
+        member.id,
+    )
+    stats_data = await asyncio.to_thread(
+        get_user_stats,
+        interaction.guild.id,
+        member.id,
+    )
+    detailed = await asyncio.to_thread(
+        get_detailed_game_stats,
+        interaction.guild.id,
+        member.id,
+    )
+
+    embed = discord.Embed(
+        title=f"🔎 Economy Lookup • {member.display_name}",
+        colour=GOLD_COLOUR,
+    )
+    embed.add_field(name="Wallet", value=format_coins(account["wallet"]), inline=True)
+    embed.add_field(name="Bank", value=format_coins(account["bank"]), inline=True)
+    embed.add_field(
+        name="Net Worth",
+        value=format_coins(account["wallet"] + account["bank"]),
+        inline=True,
+    )
+    embed.add_field(name="Level", value=str(stats_data["level"]), inline=True)
+    embed.add_field(name="Prestige", value=str(stats_data["prestige"]), inline=True)
+    embed.add_field(
+        name="Total Wagered",
+        value=format_coins(detailed["total_wagered"]),
+        inline=True,
+    )
+    embed.add_field(
+        name="Total Payout",
+        value=format_coins(detailed["total_payout"]),
+        inline=True,
+    )
+    embed.add_field(
+        name="Biggest Bet",
+        value=format_coins(detailed["biggest_bet"]),
+        inline=True,
+    )
+    embed.add_field(
+        name="Biggest Jackpot",
+        value=format_coins(detailed["biggest_jackpot"]),
+        inline=True,
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="economy_rollback",
+    description="Admin: restore the wallet from an audit entry.",
+)
+async def economy_rollback(
+    interaction: discord.Interaction,
+    audit_id: int,
+    reason: str = "Audit rollback",
+):
+    if interaction.guild is None or not await require_economy_admin(interaction):
+        return
+
+    entry = await asyncio.to_thread(
+        get_audit_entry,
+        interaction.guild.id,
+        audit_id,
+    )
+
+    if not entry:
+        await interaction.response.send_message(
+            "Audit entry not found.",
+            ephemeral=True,
+        )
+        return
+
+    if entry["previous_wallet"] is None:
+        await interaction.response.send_message(
+            "That audit entry cannot be rolled back.",
+            ephemeral=True,
+        )
+        return
+
+    member = interaction.guild.get_member(entry["target_id"])
+
+    if member is None:
+        await interaction.response.send_message(
+            "The target member is no longer in the server.",
+            ephemeral=True,
+        )
+        return
+
+    current = await asyncio.to_thread(
+        get_economy_account,
+        interaction.guild.id,
+        member.id,
+    )
+
+    previous, restored = await asyncio.to_thread(
+        admin_set_wallet,
+        interaction.guild.id,
+        member.id,
+        int(entry["previous_wallet"]),
+    )
+
+    new_audit_id = await asyncio.to_thread(
+        record_admin_audit,
+        interaction.guild.id,
+        interaction.user.id,
+        member.id,
+        "ROLLBACK",
+        None,
+        current["wallet"],
+        restored,
+        f"{reason}; source_audit={audit_id}",
+    )
+
+    await interaction.response.send_message(
+        f"Rolled back audit `{audit_id}` for {member.mention}.\n"
+        f"Wallet restored to **{format_coins(restored)}**.\n"
+        f"New audit ID: `{new_audit_id}`"
+    )
+
+
+@bot.tree.command(
+    name="ban",
+    description="Ban a member from the server.",
+)
+@app_commands.checks.has_permissions(ban_members=True)
+@app_commands.describe(
+    member="Member to ban.",
+    reason="Reason for the ban.",
+    delete_message_days="Delete up to seven days of their messages.",
+)
+async def ban_member(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided",
+    delete_message_days: app_commands.Range[int, 0, 7] = 0,
+):
+    if not await moderation_precheck(interaction, member):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await interaction.guild.ban(
+            member,
+            reason=(
+                f"{reason} | Moderator: "
+                f"{interaction.user} ({interaction.user.id})"
+            ),
+            delete_message_seconds=delete_message_days * 86400,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I do not have permission to ban that member.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as error:
+        await interaction.followup.send(
+            f"The ban failed: {error}",
+            ephemeral=True,
+        )
+        return
+
+    case_id = await asyncio.to_thread(
+        record_moderation_action,
+        interaction.guild.id,
+        interaction.user.id,
+        member.id,
+        "BAN",
+        reason,
+    )
+
+    await interaction.followup.send(
+        f"🔨 Banned **{member}**. Case `{case_id}`.",
+        ephemeral=True,
+    )
+    await send_mod_log(
+        interaction.guild,
+        "Member Banned",
+        interaction.user,
+        member,
+        reason,
+        case_id,
+        extra=f"Deleted message history: {delete_message_days} day(s)",
+    )
+
+
+@bot.tree.command(
+    name="unban",
+    description="Unban a user by Discord user ID.",
+)
+@app_commands.checks.has_permissions(ban_members=True)
+async def unban_user(
+    interaction: discord.Interaction,
+    user_id: str,
+    reason: str = "No reason provided",
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Server only.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        parsed_id = int(user_id)
+        user = await bot.fetch_user(parsed_id)
+    except (ValueError, discord.NotFound, discord.HTTPException):
+        await interaction.response.send_message(
+            "Enter a valid Discord user ID.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        await interaction.guild.unban(
+            user,
+            reason=(
+                f"{reason} | Moderator: "
+                f"{interaction.user} ({interaction.user.id})"
+            ),
+        )
+    except discord.NotFound:
+        await interaction.response.send_message(
+            "That user is not currently banned.",
+            ephemeral=True,
+        )
+        return
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I do not have permission to unban users.",
+            ephemeral=True,
+        )
+        return
+
+    case_id = await asyncio.to_thread(
+        record_moderation_action,
+        interaction.guild.id,
+        interaction.user.id,
+        user.id,
+        "UNBAN",
+        reason,
+    )
+
+    await interaction.response.send_message(
+        f"✅ Unbanned **{user}**. Case `{case_id}`.",
+        ephemeral=True,
+    )
+    await send_mod_log(
+        interaction.guild,
+        "User Unbanned",
+        interaction.user,
+        user,
+        reason,
+        case_id,
+    )
+
+
+@bot.tree.command(
+    name="kick",
+    description="Kick a member from the server.",
+)
+@app_commands.checks.has_permissions(kick_members=True)
+async def kick_member(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided",
+):
+    if not await moderation_precheck(interaction, member):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await member.kick(
+            reason=(
+                f"{reason} | Moderator: "
+                f"{interaction.user} ({interaction.user.id})"
+            )
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I do not have permission to kick that member.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as error:
+        await interaction.followup.send(
+            f"The kick failed: {error}",
+            ephemeral=True,
+        )
+        return
+
+    case_id = await asyncio.to_thread(
+        record_moderation_action,
+        interaction.guild.id,
+        interaction.user.id,
+        member.id,
+        "KICK",
+        reason,
+    )
+
+    await interaction.followup.send(
+        f"👢 Kicked **{member}**. Case `{case_id}`.",
+        ephemeral=True,
+    )
+    await send_mod_log(
+        interaction.guild,
+        "Member Kicked",
+        interaction.user,
+        member,
+        reason,
+        case_id,
+    )
+
+
+@bot.tree.command(
+    name="timeout",
+    description="Temporarily timeout a member.",
+)
+@app_commands.checks.has_permissions(moderate_members=True)
+async def timeout_member(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    minutes: app_commands.Range[int, 1, 40320],
+    reason: str = "No reason provided",
+):
+    if not await moderation_precheck(interaction, member):
+        return
+
+    until = discord.utils.utcnow() + timedelta(
+        minutes=minutes
+    )
+
+    try:
+        await member.timeout(
+            until,
+            reason=(
+                f"{reason} | Moderator: "
+                f"{interaction.user} ({interaction.user.id})"
+            ),
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I do not have permission to timeout that member.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as error:
+        await interaction.response.send_message(
+            f"The timeout failed: {error}",
+            ephemeral=True,
+        )
+        return
+
+    duration_seconds = minutes * 60
+    case_id = await asyncio.to_thread(
+        record_moderation_action,
+        interaction.guild.id,
+        interaction.user.id,
+        member.id,
+        "TIMEOUT",
+        reason,
+        duration_seconds,
+    )
+
+    await interaction.response.send_message(
+        f"⏳ Timed out {member.mention} for **{minutes} minute(s)**. "
+        f"Case `{case_id}`.",
+        ephemeral=True,
+    )
+    await send_mod_log(
+        interaction.guild,
+        "Member Timed Out",
+        interaction.user,
+        member,
+        reason,
+        case_id,
+        duration=f"{minutes} minute(s)",
+    )
+
+
+@bot.tree.command(
+    name="untimeout",
+    description="Remove a member's timeout.",
+)
+@app_commands.checks.has_permissions(moderate_members=True)
+async def untimeout_member(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "Timeout removed",
+):
+    if not await moderation_precheck(interaction, member):
+        return
+
+    try:
+        await member.timeout(
+            None,
+            reason=(
+                f"{reason} | Moderator: "
+                f"{interaction.user} ({interaction.user.id})"
+            ),
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I do not have permission to remove that timeout.",
+            ephemeral=True,
+        )
+        return
+
+    case_id = await asyncio.to_thread(
+        record_moderation_action,
+        interaction.guild.id,
+        interaction.user.id,
+        member.id,
+        "UNTIMEOUT",
+        reason,
+    )
+
+    await interaction.response.send_message(
+        f"✅ Removed {member.mention}'s timeout. Case `{case_id}`.",
+        ephemeral=True,
+    )
+    await send_mod_log(
+        interaction.guild,
+        "Timeout Removed",
+        interaction.user,
+        member,
+        reason,
+        case_id,
+    )
+
+
+@bot.tree.command(
+    name="warn",
+    description="Add a persistent warning to a member.",
+)
+@app_commands.checks.has_permissions(moderate_members=True)
+async def warn_member(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str,
+):
+    if not await moderation_precheck(interaction, member):
+        return
+
+    warning_id = await asyncio.to_thread(
+        add_warning,
+        interaction.guild.id,
+        member.id,
+        interaction.user.id,
+        reason,
+    )
+
+    case_id = await asyncio.to_thread(
+        record_moderation_action,
+        interaction.guild.id,
+        interaction.user.id,
+        member.id,
+        "WARN",
+        reason,
+    )
+
+    try:
+        await member.send(
+            f"You were warned in **{interaction.guild.name}**.\n"
+            f"Reason: **{reason}**\nWarning ID: `{warning_id}`"
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    await interaction.response.send_message(
+        f"⚠️ Warned {member.mention}. Warning `{warning_id}`, "
+        f"case `{case_id}`.",
+        ephemeral=True,
+    )
+    await send_mod_log(
+        interaction.guild,
+        "Member Warned",
+        interaction.user,
+        member,
+        reason,
+        case_id,
+        extra=f"Warning ID: {warning_id}",
+    )
+
+
+@bot.tree.command(
+    name="warnings",
+    description="View a member's active warnings.",
+)
+@app_commands.checks.has_permissions(moderate_members=True)
+async def view_warnings(
+    interaction: discord.Interaction,
+    member: discord.Member,
+):
+    if interaction.guild is None:
+        return
+
+    warnings_data = await asyncio.to_thread(
+        get_active_warnings,
+        interaction.guild.id,
+        member.id,
+    )
+
+    if not warnings_data:
+        await interaction.response.send_message(
+            f"{member.mention} has no active warnings.",
+            ephemeral=True,
+        )
+        return
+
+    lines = []
+    for warning in warnings_data:
+        timestamp = datetime.fromtimestamp(
+            warning["created_at"],
+            tz=timezone.utc,
+        )
+        lines.append(
+            f"`#{warning['id']}` • "
+            f"{discord.utils.format_dt(timestamp, style='d')} • "
+            f"{warning['reason'][:180]}"
+        )
+
+    embed = discord.Embed(
+        title=f"⚠️ Warnings • {member}",
+        description="\n".join(lines),
+        colour=GOLD_COLOUR,
+    )
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="clear_warnings",
+    description="Clear all active warnings for a member.",
+)
+@app_commands.checks.has_permissions(moderate_members=True)
+async def clear_warnings_command(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "Warnings cleared",
+):
+    if interaction.guild is None:
+        return
+
+    cleared = await asyncio.to_thread(
+        clear_active_warnings,
+        interaction.guild.id,
+        member.id,
+    )
+
+    case_id = await asyncio.to_thread(
+        record_moderation_action,
+        interaction.guild.id,
+        interaction.user.id,
+        member.id,
+        "CLEAR_WARNINGS",
+        reason,
+    )
+
+    await interaction.response.send_message(
+        f"Cleared **{cleared}** warning(s) for {member.mention}. "
+        f"Case `{case_id}`.",
+        ephemeral=True,
+    )
+    await send_mod_log(
+        interaction.guild,
+        "Warnings Cleared",
+        interaction.user,
+        member,
+        reason,
+        case_id,
+        extra=f"Warnings cleared: {cleared}",
+    )
+
+
+@bot.tree.command(
+    name="purge",
+    description="Delete recent messages from the current channel.",
+)
+@app_commands.checks.has_permissions(manage_messages=True)
+async def purge_messages(
+    interaction: discord.Interaction,
+    amount: app_commands.Range[int, 1, 500],
+    member: discord.Member | None = None,
+):
+    if not isinstance(
+        interaction.channel,
+        discord.TextChannel,
+    ):
+        await interaction.response.send_message(
+            "This command requires a text channel.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    check = (
+        (lambda message: message.author.id == member.id)
+        if member
+        else None
+    )
+
+    try:
+        deleted = await interaction.channel.purge(
+            limit=amount,
+            check=check,
+            reason=f"Purge by {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I do not have permission to delete messages here.",
+            ephemeral=True,
+        )
+        return
+
+    reason = (
+        f"Purged {len(deleted)} messages"
+        + (f" from {member}" if member else "")
+    )
+    case_id = await asyncio.to_thread(
+        record_moderation_action,
+        interaction.guild.id,
+        interaction.user.id,
+        member.id if member else None,
+        "PURGE",
+        reason,
+    )
+
+    await interaction.followup.send(
+        f"🧹 Deleted **{len(deleted)}** message(s). "
+        f"Case `{case_id}`.",
+        ephemeral=True,
+    )
+    await send_mod_log(
+        interaction.guild,
+        "Messages Purged",
+        interaction.user,
+        member,
+        reason,
+        case_id,
+        extra=f"Channel: {interaction.channel.mention}",
+    )
+
+
+@bot.tree.command(
+    name="lock",
+    description="Lock the current text channel.",
+)
+@app_commands.checks.has_permissions(manage_channels=True)
+async def lock_channel(
+    interaction: discord.Interaction,
+    reason: str = "Channel locked",
+):
+    if not isinstance(
+        interaction.channel,
+        discord.TextChannel,
+    ):
+        await interaction.response.send_message(
+            "This command requires a text channel.",
+            ephemeral=True,
+        )
+        return
+
+    overwrite = interaction.channel.overwrites_for(
+        interaction.guild.default_role
+    )
+    overwrite.send_messages = False
+
+    try:
+        await interaction.channel.set_permissions(
+            interaction.guild.default_role,
+            overwrite=overwrite,
+            reason=f"{reason} | {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I do not have permission to lock this channel.",
+            ephemeral=True,
+        )
+        return
+
+    case_id = await asyncio.to_thread(
+        record_moderation_action,
+        interaction.guild.id,
+        interaction.user.id,
+        None,
+        "LOCK",
+        reason,
+    )
+
+    await interaction.response.send_message(
+        f"🔒 {interaction.channel.mention} is now locked. "
+        f"Case `{case_id}`."
+    )
+    await send_mod_log(
+        interaction.guild,
+        "Channel Locked",
+        interaction.user,
+        None,
+        reason,
+        case_id,
+        extra=f"Channel: {interaction.channel.mention}",
+    )
+
+
+@bot.tree.command(
+    name="unlock",
+    description="Unlock the current text channel.",
+)
+@app_commands.checks.has_permissions(manage_channels=True)
+async def unlock_channel(
+    interaction: discord.Interaction,
+    reason: str = "Channel unlocked",
+):
+    if not isinstance(
+        interaction.channel,
+        discord.TextChannel,
+    ):
+        await interaction.response.send_message(
+            "This command requires a text channel.",
+            ephemeral=True,
+        )
+        return
+
+    overwrite = interaction.channel.overwrites_for(
+        interaction.guild.default_role
+    )
+    overwrite.send_messages = None
+
+    try:
+        await interaction.channel.set_permissions(
+            interaction.guild.default_role,
+            overwrite=overwrite,
+            reason=f"{reason} | {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I do not have permission to unlock this channel.",
+            ephemeral=True,
+        )
+        return
+
+    case_id = await asyncio.to_thread(
+        record_moderation_action,
+        interaction.guild.id,
+        interaction.user.id,
+        None,
+        "UNLOCK",
+        reason,
+    )
+
+    await interaction.response.send_message(
+        f"🔓 {interaction.channel.mention} is now unlocked. "
+        f"Case `{case_id}`."
+    )
+    await send_mod_log(
+        interaction.guild,
+        "Channel Unlocked",
+        interaction.user,
+        None,
+        reason,
+        case_id,
+        extra=f"Channel: {interaction.channel.mention}",
+    )
+
+
+@bot.tree.command(
+    name="slowmode",
+    description="Set the current channel's slowmode.",
+)
+@app_commands.checks.has_permissions(manage_channels=True)
+async def set_slowmode(
+    interaction: discord.Interaction,
+    seconds: app_commands.Range[int, 0, 21600],
+    reason: str = "Slowmode updated",
+):
+    if not isinstance(
+        interaction.channel,
+        discord.TextChannel,
+    ):
+        await interaction.response.send_message(
+            "This command requires a text channel.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        await interaction.channel.edit(
+            slowmode_delay=seconds,
+            reason=f"{reason} | {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I do not have permission to change slowmode.",
+            ephemeral=True,
+        )
+        return
+
+    case_id = await asyncio.to_thread(
+        record_moderation_action,
+        interaction.guild.id,
+        interaction.user.id,
+        None,
+        "SLOWMODE",
+        reason,
+        seconds,
+    )
+
+    await interaction.response.send_message(
+        (
+            "🚦 Slowmode disabled."
+            if seconds == 0
+            else f"🚦 Slowmode set to **{seconds} seconds**."
+        )
+        + f" Case `{case_id}`."
+    )
+
+
+@bot.tree.command(
+    name="security_status",
+    description="View the bot's active security configuration.",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def security_status(
+    interaction: discord.Interaction,
+):
+    embed = discord.Embed(
+        title="🛡️ 777 Security Status",
+        colour=GOLD_COLOUR,
+    )
+    embed.add_field(
+        name="Anti-Spam",
+        value=(
+            f"{'Enabled' if ANTI_SPAM_ENABLED else 'Disabled'}\n"
+            f"{ANTI_SPAM_MESSAGE_LIMIT} messages / "
+            f"{ANTI_SPAM_WINDOW_SECONDS}s\n"
+            f"Timeout: {ANTI_SPAM_TIMEOUT_MINUTES}m"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Anti-Raid",
+        value=(
+            f"{'Enabled' if ANTI_RAID_ENABLED else 'Disabled'}\n"
+            f"{ANTI_RAID_JOIN_LIMIT} joins / "
+            f"{ANTI_RAID_WINDOW_SECONDS}s\n"
+            f"New-account threshold: "
+            f"{ANTI_RAID_ACCOUNT_AGE_HOURS}h"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Automatic New-Account Timeout",
+        value=(
+            "Enabled"
+            if ANTI_RAID_AUTO_TIMEOUT
+            else "Disabled (alert only)"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Moderation Log",
+        value=(
+            f"<#{MOD_LOG_CHANNEL_ID}>"
+            if MOD_LOG_CHANNEL_ID
+            else "Not configured"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Security Alerts",
+        value=(
+            f"<#{SECURITY_ALERT_CHANNEL_ID}>"
+            if SECURITY_ALERT_CHANNEL_ID
+            else "Not configured"
+        ),
+        inline=True,
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
     )
 
 
