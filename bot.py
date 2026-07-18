@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import random
+import sqlite3
 import time
 import textwrap
 import threading
@@ -34,6 +35,12 @@ WELCOME_CHANNEL_ID = os.getenv("WELCOME_CHANNEL_ID")
 COUNTING_CHANNEL_ID = os.getenv("COUNTING_CHANNEL_ID")
 CLIPS_CHANNEL_ID = os.getenv("CLIPS_CHANNEL_ID")
 SUGGESTIONS_CHANNEL_ID = os.getenv("SUGGESTIONS_CHANNEL_ID")
+ECONOMY_DB_PATH = os.getenv("ECONOMY_DB_PATH", "economy.db")
+ECONOMY_STARTING_BALANCE = int(
+    os.getenv("ECONOMY_STARTING_BALANCE", "500")
+)
+SLOTS_MIN_BET = int(os.getenv("SLOTS_MIN_BET", "10"))
+SLOTS_MAX_BET = int(os.getenv("SLOTS_MAX_BET", "10000"))
 PORT = int(os.getenv("PORT", "10000"))
 
 BANNER_URL = os.getenv(
@@ -2684,8 +2691,1628 @@ class GiveawayView(discord.ui.View):
 
 
 # =========================================================
+# ECONOMY DATABASE
+# =========================================================
+
+economy_lock = threading.RLock()
+
+
+def economy_connection() -> sqlite3.Connection:
+    database_path = Path(ECONOMY_DB_PATH)
+
+    if database_path.parent != Path("."):
+        database_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    connection = sqlite3.connect(
+        database_path,
+        timeout=30,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA foreign_keys=ON")
+    return connection
+
+
+def initialize_economy_database() -> None:
+    with economy_lock, economy_connection() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS economy_users (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                wallet INTEGER NOT NULL DEFAULT 0,
+                bank INTEGER NOT NULL DEFAULT 0,
+                total_earned INTEGER NOT NULL DEFAULT 0,
+                total_lost INTEGER NOT NULL DEFAULT 0,
+                daily_streak INTEGER NOT NULL DEFAULT 0,
+                last_daily INTEGER,
+                last_work INTEGER,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS economy_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                transaction_type TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                balance_after INTEGER NOT NULL,
+                metadata TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_economy_leaderboard
+            ON economy_users(guild_id, wallet, bank);
+            """
+        )
+
+
+def ensure_economy_user(
+    guild_id: int,
+    user_id: int,
+) -> None:
+    now = int(time.time())
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO economy_users (
+                guild_id,
+                user_id,
+                wallet,
+                bank,
+                total_earned,
+                total_lost,
+                daily_streak,
+                created_at
+            )
+            VALUES (?, ?, ?, 0, ?, 0, 0, ?)
+            """,
+            (
+                guild_id,
+                user_id,
+                ECONOMY_STARTING_BALANCE,
+                ECONOMY_STARTING_BALANCE,
+                now,
+            ),
+        )
+
+
+def get_economy_account(
+    guild_id: int,
+    user_id: int,
+) -> dict:
+    ensure_economy_user(guild_id, user_id)
+
+    with economy_lock, economy_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM economy_users
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+    return dict(row)
+
+
+def record_economy_transaction(
+    connection: sqlite3.Connection,
+    guild_id: int,
+    user_id: int,
+    transaction_type: str,
+    amount: int,
+    balance_after: int,
+    metadata: str = "",
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO economy_transactions (
+            guild_id,
+            user_id,
+            transaction_type,
+            amount,
+            balance_after,
+            metadata,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            guild_id,
+            user_id,
+            transaction_type,
+            amount,
+            balance_after,
+            metadata,
+            int(time.time()),
+        ),
+    )
+
+
+def change_wallet(
+    guild_id: int,
+    user_id: int,
+    amount: int,
+    transaction_type: str,
+    metadata: str = "",
+) -> tuple[bool, int]:
+    ensure_economy_user(guild_id, user_id)
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+
+        row = connection.execute(
+            """
+            SELECT wallet, total_earned, total_lost
+            FROM economy_users
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+        new_wallet = row["wallet"] + amount
+
+        if new_wallet < 0:
+            connection.rollback()
+            return False, row["wallet"]
+
+        earned_change = max(amount, 0)
+        lost_change = max(-amount, 0)
+
+        connection.execute(
+            """
+            UPDATE economy_users
+            SET wallet = ?,
+                total_earned = total_earned + ?,
+                total_lost = total_lost + ?
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (
+                new_wallet,
+                earned_change,
+                lost_change,
+                guild_id,
+                user_id,
+            ),
+        )
+
+        record_economy_transaction(
+            connection,
+            guild_id,
+            user_id,
+            transaction_type,
+            amount,
+            new_wallet,
+            metadata,
+        )
+
+        connection.commit()
+        return True, new_wallet
+
+
+def transfer_wallet_bank(
+    guild_id: int,
+    user_id: int,
+    amount: int,
+    to_bank: bool,
+) -> tuple[bool, dict]:
+    ensure_economy_user(guild_id, user_id)
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+
+        row = connection.execute(
+            """
+            SELECT wallet, bank
+            FROM economy_users
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+        wallet = row["wallet"]
+        bank = row["bank"]
+
+        if to_bank:
+            if amount > wallet:
+                connection.rollback()
+                return False, {"wallet": wallet, "bank": bank}
+
+            wallet -= amount
+            bank += amount
+            transaction_type = "deposit"
+            transaction_amount = -amount
+
+        else:
+            if amount > bank:
+                connection.rollback()
+                return False, {"wallet": wallet, "bank": bank}
+
+            bank -= amount
+            wallet += amount
+            transaction_type = "withdraw"
+            transaction_amount = amount
+
+        connection.execute(
+            """
+            UPDATE economy_users
+            SET wallet = ?, bank = ?
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (wallet, bank, guild_id, user_id),
+        )
+
+        record_economy_transaction(
+            connection,
+            guild_id,
+            user_id,
+            transaction_type,
+            transaction_amount,
+            wallet,
+            f"bank_balance={bank}",
+        )
+
+        connection.commit()
+        return True, {"wallet": wallet, "bank": bank}
+
+
+def pay_economy_user(
+    guild_id: int,
+    sender_id: int,
+    recipient_id: int,
+    amount: int,
+) -> tuple[bool, str]:
+    ensure_economy_user(guild_id, sender_id)
+    ensure_economy_user(guild_id, recipient_id)
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+
+        sender = connection.execute(
+            """
+            SELECT wallet
+            FROM economy_users
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, sender_id),
+        ).fetchone()
+
+        if sender["wallet"] < amount:
+            connection.rollback()
+            return False, "insufficient"
+
+        recipient = connection.execute(
+            """
+            SELECT wallet
+            FROM economy_users
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, recipient_id),
+        ).fetchone()
+
+        sender_wallet = sender["wallet"] - amount
+        recipient_wallet = recipient["wallet"] + amount
+
+        connection.execute(
+            """
+            UPDATE economy_users
+            SET wallet = ?
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (sender_wallet, guild_id, sender_id),
+        )
+
+        connection.execute(
+            """
+            UPDATE economy_users
+            SET wallet = ?,
+                total_earned = total_earned + ?
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (
+                recipient_wallet,
+                amount,
+                guild_id,
+                recipient_id,
+            ),
+        )
+
+        record_economy_transaction(
+            connection,
+            guild_id,
+            sender_id,
+            "pay_sent",
+            -amount,
+            sender_wallet,
+            f"recipient={recipient_id}",
+        )
+
+        record_economy_transaction(
+            connection,
+            guild_id,
+            recipient_id,
+            "pay_received",
+            amount,
+            recipient_wallet,
+            f"sender={sender_id}",
+        )
+
+        connection.commit()
+        return True, "ok"
+
+
+def claim_daily_reward(
+    guild_id: int,
+    user_id: int,
+) -> tuple[bool, int, int, int]:
+    ensure_economy_user(guild_id, user_id)
+    now = int(time.time())
+    cooldown = 24 * 60 * 60
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+
+        row = connection.execute(
+            """
+            SELECT wallet, last_daily, daily_streak
+            FROM economy_users
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+        last_daily = row["last_daily"]
+
+        if last_daily and now - last_daily < cooldown:
+            remaining = cooldown - (now - last_daily)
+            connection.rollback()
+            return False, remaining, row["daily_streak"], row["wallet"]
+
+        if last_daily and now - last_daily <= 48 * 60 * 60:
+            streak = row["daily_streak"] + 1
+        else:
+            streak = 1
+
+        streak = min(streak, 30)
+        reward = 250 + min(streak * 25, 500)
+        new_wallet = row["wallet"] + reward
+
+        connection.execute(
+            """
+            UPDATE economy_users
+            SET wallet = ?,
+                total_earned = total_earned + ?,
+                daily_streak = ?,
+                last_daily = ?
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (
+                new_wallet,
+                reward,
+                streak,
+                now,
+                guild_id,
+                user_id,
+            ),
+        )
+
+        record_economy_transaction(
+            connection,
+            guild_id,
+            user_id,
+            "daily",
+            reward,
+            new_wallet,
+            f"streak={streak}",
+        )
+
+        connection.commit()
+        return True, reward, streak, new_wallet
+
+
+def perform_work(
+    guild_id: int,
+    user_id: int,
+) -> tuple[bool, int, int, str]:
+    ensure_economy_user(guild_id, user_id)
+    now = int(time.time())
+    cooldown = 30 * 60
+
+    jobs = [
+        ("delivered Roblox pizzas", 80, 180),
+        ("tested a new obby", 100, 220),
+        ("moderated a chaotic server", 120, 260),
+        ("built a Roblox map", 150, 320),
+        ("streamed a gaming session", 90, 240),
+        ("won a small tournament", 180, 360),
+    ]
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+
+        row = connection.execute(
+            """
+            SELECT wallet, last_work
+            FROM economy_users
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+        last_work = row["last_work"]
+
+        if last_work and now - last_work < cooldown:
+            remaining = cooldown - (now - last_work)
+            connection.rollback()
+            return False, remaining, row["wallet"], ""
+
+        job_name, minimum, maximum = random.choice(jobs)
+        reward = random.randint(minimum, maximum)
+        new_wallet = row["wallet"] + reward
+
+        connection.execute(
+            """
+            UPDATE economy_users
+            SET wallet = ?,
+                total_earned = total_earned + ?,
+                last_work = ?
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (
+                new_wallet,
+                reward,
+                now,
+                guild_id,
+                user_id,
+            ),
+        )
+
+        record_economy_transaction(
+            connection,
+            guild_id,
+            user_id,
+            "work",
+            reward,
+            new_wallet,
+            job_name,
+        )
+
+        connection.commit()
+        return True, reward, new_wallet, job_name
+
+
+def economy_leaderboard(
+    guild_id: int,
+    limit: int = 10,
+) -> list[dict]:
+    with economy_lock, economy_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT user_id, wallet, bank, wallet + bank AS net_worth
+            FROM economy_users
+            WHERE guild_id = ?
+            ORDER BY net_worth DESC
+            LIMIT ?
+            """,
+            (guild_id, limit),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def format_coins(amount: int) -> str:
+    return f"{amount:,} 🪙"
+
+
+def format_cooldown(seconds: int) -> str:
+    seconds = max(0, seconds)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+
+    if minutes:
+        return f"{minutes}m {seconds}s"
+
+    return f"{seconds}s"
+
+
+# =========================================================
+# PREMIUM SLOTS
+# =========================================================
+
+SLOT_SYMBOLS = [
+    {
+        "key": "cherry",
+        "emoji": "🍒",
+        "label": "CHERRY",
+        "weight": 28,
+        "triple": 3,
+    },
+    {
+        "key": "lemon",
+        "emoji": "🍋",
+        "label": "LEMON",
+        "weight": 24,
+        "triple": 4,
+    },
+    {
+        "key": "grape",
+        "emoji": "🍇",
+        "label": "GRAPE",
+        "weight": 20,
+        "triple": 5,
+    },
+    {
+        "key": "bell",
+        "emoji": "🔔",
+        "label": "BELL",
+        "weight": 14,
+        "triple": 8,
+    },
+    {
+        "key": "diamond",
+        "emoji": "💎",
+        "label": "DIAMOND",
+        "weight": 9,
+        "triple": 15,
+    },
+    {
+        "key": "seven",
+        "emoji": "7",
+        "label": "SEVEN",
+        "weight": 5,
+        "triple": 30,
+    },
+]
+
+
+def spin_slot_reels() -> list[dict]:
+    return random.choices(
+        SLOT_SYMBOLS,
+        weights=[symbol["weight"] for symbol in SLOT_SYMBOLS],
+        k=3,
+    )
+
+
+def calculate_slot_multiplier(
+    reels: list[dict],
+) -> tuple[float, str]:
+    keys = [symbol["key"] for symbol in reels]
+
+    if len(set(keys)) == 1:
+        symbol = reels[0]
+        multiplier = float(symbol["triple"])
+
+        if symbol["key"] == "seven":
+            return multiplier, "777 JACKPOT"
+
+        return multiplier, f"TRIPLE {symbol['label']}"
+
+    for symbol_key in set(keys):
+        if keys.count(symbol_key) == 2:
+            matching = next(
+                symbol
+                for symbol in SLOT_SYMBOLS
+                if symbol["key"] == symbol_key
+            )
+
+            pair_multipliers = {
+                "cherry": 1.2,
+                "lemon": 1.25,
+                "grape": 1.35,
+                "bell": 1.5,
+                "diamond": 2.0,
+                "seven": 3.0,
+            }
+
+            return (
+                pair_multipliers[matching["key"]],
+                f"PAIR OF {matching['label']}S",
+            )
+
+    if "cherry" in keys:
+        return 0.35, "CHERRY REFUND"
+
+    return 0.0, "NO WIN"
+
+
+def get_slot_font(
+    size: int,
+    bold: bool = False,
+) -> ImageFont.ImageFont:
+    candidates = [
+        (
+            "/usr/share/fonts/truetype/dejavu/"
+            + (
+                "DejaVuSans-Bold.ttf"
+                if bold
+                else "DejaVuSans.ttf"
+            )
+        ),
+        (
+            "/usr/share/fonts/truetype/liberation2/"
+            + (
+                "LiberationSans-Bold.ttf"
+                if bold
+                else "LiberationSans-Regular.ttf"
+            )
+        ),
+    ]
+
+    for font_path in candidates:
+        if Path(font_path).exists():
+            return ImageFont.truetype(font_path, size)
+
+    return ImageFont.load_default()
+
+
+def create_slots_image(
+    player_name: str,
+    reels: list[dict],
+    bet: int,
+    payout: int,
+    multiplier: float,
+    balance: int,
+    result_name: str,
+) -> io.BytesIO:
+    width = 1200
+    height = 720
+    image = Image.new(
+        "RGB",
+        (width, height),
+        (7, 7, 10),
+    )
+    draw = ImageDraw.Draw(image)
+
+    gold = (245, 190, 45)
+    light_gold = (255, 225, 120)
+    dark_gold = (105, 72, 10)
+    panel = (19, 19, 25)
+    reel_background = (238, 232, 212)
+    reel_text = (20, 18, 15)
+    muted = (170, 170, 178)
+
+    # Border and machine shell.
+    draw.rounded_rectangle(
+        (30, 30, width - 30, height - 30),
+        radius=38,
+        fill=panel,
+        outline=gold,
+        width=8,
+    )
+
+    draw.rounded_rectangle(
+        (65, 70, width - 65, 190),
+        radius=28,
+        fill=(10, 10, 14),
+        outline=dark_gold,
+        width=4,
+    )
+
+    title_font = get_slot_font(68, bold=True)
+    subtitle_font = get_slot_font(28, bold=True)
+    symbol_font = get_slot_font(92, bold=True)
+    label_font = get_slot_font(24, bold=True)
+    info_font = get_slot_font(30, bold=True)
+    small_font = get_slot_font(23, bold=False)
+
+    draw.text(
+        (width // 2, 112),
+        "777 ROYALE SLOTS",
+        font=title_font,
+        fill=light_gold,
+        anchor="mm",
+    )
+
+    draw.text(
+        (width // 2, 165),
+        result_name,
+        font=subtitle_font,
+        fill=gold,
+        anchor="mm",
+    )
+
+    reel_width = 290
+    reel_height = 260
+    gap = 34
+    total_reel_width = reel_width * 3 + gap * 2
+    start_x = (width - total_reel_width) // 2
+    reel_y = 230
+
+    for index, symbol in enumerate(reels):
+        x1 = start_x + index * (reel_width + gap)
+        x2 = x1 + reel_width
+
+        draw.rounded_rectangle(
+            (x1, reel_y, x2, reel_y + reel_height),
+            radius=30,
+            fill=reel_background,
+            outline=gold,
+            width=7,
+        )
+
+        display_symbol = (
+            "7"
+            if symbol["key"] == "seven"
+            else symbol["emoji"]
+        )
+
+        draw.text(
+            ((x1 + x2) // 2, reel_y + 105),
+            display_symbol,
+            font=symbol_font,
+            fill=(
+                (190, 20, 25)
+                if symbol["key"] == "seven"
+                else reel_text
+            ),
+            anchor="mm",
+            embedded_color=True,
+        )
+
+        draw.text(
+            ((x1 + x2) // 2, reel_y + 215),
+            symbol["label"],
+            font=label_font,
+            fill=dark_gold,
+            anchor="mm",
+        )
+
+    # Winning line.
+    line_y = reel_y + reel_height // 2
+    draw.line(
+        (start_x - 18, line_y, start_x + total_reel_width + 18, line_y),
+        fill=(220, 35, 45),
+        width=6,
+    )
+
+    info_y = 545
+    columns = [
+        ("BET", format_coins(bet)),
+        (
+            "PAYOUT",
+            format_coins(payout),
+        ),
+        (
+            "MULTIPLIER",
+            f"{multiplier:g}×",
+        ),
+        (
+            "BALANCE",
+            format_coins(balance),
+        ),
+    ]
+
+    column_width = (width - 120) // len(columns)
+
+    for index, (label, value) in enumerate(columns):
+        center_x = 60 + column_width * index + column_width // 2
+
+        draw.text(
+            (center_x, info_y),
+            label,
+            font=small_font,
+            fill=muted,
+            anchor="mm",
+        )
+
+        draw.text(
+            (center_x, info_y + 44),
+            value,
+            font=info_font,
+            fill=light_gold,
+            anchor="mm",
+        )
+
+    draw.text(
+        (width // 2, 665),
+        f"PLAYER: {player_name[:32]}  •  PLAY RESPONSIBLY  •  777",
+        font=small_font,
+        fill=muted,
+        anchor="mm",
+    )
+
+    output = io.BytesIO()
+    image.save(
+        output,
+        format="PNG",
+        optimize=True,
+    )
+    output.seek(0)
+    return output
+
+
+def slots_spin_embed(
+    player: discord.Member | discord.User,
+    bet: int,
+    frame: list[str],
+    stage: int,
+) -> discord.Embed:
+    display = " │ ".join(frame)
+
+    embed = discord.Embed(
+        title="🎰 777 Royale Slots",
+        description=(
+            f"### `{display}`\n\n"
+            f"Spinning reel **{stage}/3**..."
+        ),
+        colour=GOLD_COLOUR,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    embed.set_author(
+        name=player.display_name,
+        icon_url=player.display_avatar.url,
+    )
+
+    embed.add_field(
+        name="Bet",
+        value=format_coins(bet),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Status",
+        value="The reels are spinning...",
+        inline=True,
+    )
+
+    embed.set_footer(
+        text="777 • Royale Casino"
+    )
+    return embed
+
+
+class SlotsReplayView(discord.ui.View):
+    def __init__(
+        self,
+        owner_id: int,
+        bet: int,
+    ):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.bet = bet
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the player who started this spin can use these buttons.",
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+    @discord.ui.button(
+        label="Spin Again",
+        emoji="🎰",
+        style=discord.ButtonStyle.success,
+    )
+    async def spin_again(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await execute_slots_spin(
+            interaction,
+            self.bet,
+            from_button=True,
+        )
+
+    @discord.ui.button(
+        label="Double Bet",
+        emoji="⚡",
+        style=discord.ButtonStyle.primary,
+    )
+    async def double_bet(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        doubled_bet = min(
+            self.bet * 2,
+            SLOTS_MAX_BET,
+        )
+
+        await execute_slots_spin(
+            interaction,
+            doubled_bet,
+            from_button=True,
+        )
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+
+slots_user_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+
+def get_slots_lock(
+    guild_id: int,
+    user_id: int,
+) -> asyncio.Lock:
+    key = (guild_id, user_id)
+
+    if key not in slots_user_locks:
+        slots_user_locks[key] = asyncio.Lock()
+
+    return slots_user_locks[key]
+
+
+async def execute_slots_spin(
+    interaction: discord.Interaction,
+    bet: int,
+    from_button: bool = False,
+) -> None:
+    if interaction.guild is None:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "Slots can only be played inside a server.",
+                ephemeral=True,
+            )
+        return
+
+    if bet < SLOTS_MIN_BET or bet > SLOTS_MAX_BET:
+        message = (
+            f"Your bet must be between "
+            f"{format_coins(SLOTS_MIN_BET)} and "
+            f"{format_coins(SLOTS_MAX_BET)}."
+        )
+
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                message,
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                message,
+                ephemeral=True,
+            )
+        return
+
+    lock = get_slots_lock(
+        interaction.guild.id,
+        interaction.user.id,
+    )
+
+    if lock.locked():
+        message = "Your previous slots spin is still running."
+
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                message,
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                message,
+                ephemeral=True,
+            )
+        return
+
+    async with lock:
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+
+        account = await asyncio.to_thread(
+            get_economy_account,
+            interaction.guild.id,
+            interaction.user.id,
+        )
+
+        if account["wallet"] < bet:
+            await interaction.followup.send(
+                f"You need {format_coins(bet)} in your wallet, "
+                f"but you only have {format_coins(account['wallet'])}.",
+                ephemeral=True,
+            )
+            return
+
+        charged, balance_after_bet = await asyncio.to_thread(
+            change_wallet,
+            interaction.guild.id,
+            interaction.user.id,
+            -bet,
+            "slots_bet",
+            f"bet={bet}",
+        )
+
+        if not charged:
+            await interaction.followup.send(
+                "Your balance changed before the spin could start. Try again.",
+                ephemeral=True,
+            )
+            return
+
+        hidden = ["❔", "❔", "❔"]
+
+        try:
+            await interaction.edit_original_response(
+                embed=slots_spin_embed(
+                    interaction.user,
+                    bet,
+                    hidden,
+                    0,
+                ),
+                attachments=[],
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
+
+        reels = spin_slot_reels()
+
+        for stage in range(1, 4):
+            frame = [
+                reels[index]["emoji"]
+                if index < stage
+                else random.choice(
+                    ["🍒", "🍋", "🍇", "🔔", "💎", "7️⃣"]
+                )
+                for index in range(3)
+            ]
+
+            await asyncio.sleep(0.75)
+
+            try:
+                await interaction.edit_original_response(
+                    embed=slots_spin_embed(
+                        interaction.user,
+                        bet,
+                        frame,
+                        stage,
+                    ),
+                    attachments=[],
+                    view=None,
+                )
+            except discord.HTTPException:
+                logger.warning(
+                    "A slots animation frame could not be displayed."
+                )
+
+        multiplier, result_name = calculate_slot_multiplier(
+            reels
+        )
+        payout = int(round(bet * multiplier))
+        profit = payout - bet
+
+        if payout > 0:
+            _, final_balance = await asyncio.to_thread(
+                change_wallet,
+                interaction.guild.id,
+                interaction.user.id,
+                payout,
+                "slots_payout",
+                (
+                    f"bet={bet};multiplier={multiplier};"
+                    f"result={result_name}"
+                ),
+            )
+        else:
+            final_balance = balance_after_bet
+
+        result_image = await asyncio.to_thread(
+            create_slots_image,
+            interaction.user.display_name,
+            reels,
+            bet,
+            payout,
+            multiplier,
+            final_balance,
+            result_name,
+        )
+
+        filename = (
+            f"777_slots_{interaction.user.id}_"
+            f"{int(time.time())}.png"
+        )
+        file = discord.File(
+            result_image,
+            filename=filename,
+        )
+
+        if profit > 0:
+            outcome = (
+                f"## 🎉 You won {format_coins(profit)} profit!"
+            )
+        elif profit == 0:
+            outcome = "## 🤝 You broke even."
+        else:
+            outcome = (
+                f"## 💸 You lost {format_coins(abs(profit))}."
+            )
+
+        result_embed = discord.Embed(
+            title=(
+                "💎 777 JACKPOT!"
+                if result_name == "777 JACKPOT"
+                else "🎰 777 Royale Slots"
+            ),
+            description=(
+                f"{outcome}\n\n"
+                f"**Result:** {result_name}"
+            ),
+            colour=GOLD_COLOUR,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        result_embed.set_author(
+            name=interaction.user.display_name,
+            icon_url=interaction.user.display_avatar.url,
+        )
+
+        result_embed.set_image(
+            url=f"attachment://{filename}"
+        )
+
+        result_embed.add_field(
+            name="Bet",
+            value=format_coins(bet),
+            inline=True,
+        )
+
+        result_embed.add_field(
+            name="Payout",
+            value=format_coins(payout),
+            inline=True,
+        )
+
+        result_embed.add_field(
+            name="Multiplier",
+            value=f"`{multiplier:g}×`",
+            inline=True,
+        )
+
+        result_embed.add_field(
+            name="New Wallet",
+            value=format_coins(final_balance),
+            inline=False,
+        )
+
+        result_embed.set_footer(
+            text="777 • Royale Casino • Play responsibly"
+        )
+
+        replay_view = SlotsReplayView(
+            owner_id=interaction.user.id,
+            bet=bet,
+        )
+
+        try:
+            await interaction.edit_original_response(
+                embed=result_embed,
+                attachments=[file],
+                view=replay_view,
+            )
+
+        except discord.HTTPException:
+            logger.exception(
+                "Failed to display slots result."
+            )
+
+            await interaction.followup.send(
+                embed=result_embed,
+                file=file,
+                view=replay_view,
+            )
+
+
+initialize_economy_database()
+
+
+# =========================================================
 # SLASH COMMANDS
 # =========================================================
+
+@bot.tree.command(
+    name="balance",
+    description="View your or another member's economy balance.",
+)
+@app_commands.describe(
+    member="Optional member whose balance you want to view."
+)
+async def balance(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    target = member or interaction.user
+
+    if target.bot:
+        await interaction.response.send_message(
+            "Bots do not have economy accounts.",
+            ephemeral=True,
+        )
+        return
+
+    account = await asyncio.to_thread(
+        get_economy_account,
+        interaction.guild.id,
+        target.id,
+    )
+
+    net_worth = account["wallet"] + account["bank"]
+
+    embed = discord.Embed(
+        title="💰 777 Economy",
+        description=f"Balance for {target.mention}",
+        colour=GOLD_COLOUR,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    embed.set_thumbnail(
+        url=target.display_avatar.url
+    )
+
+    embed.add_field(
+        name="Wallet",
+        value=format_coins(account["wallet"]),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Bank",
+        value=format_coins(account["bank"]),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Net Worth",
+        value=format_coins(net_worth),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Daily Streak",
+        value=f"`{account['daily_streak']}` day(s)",
+        inline=True,
+    )
+
+    embed.set_footer(
+        text="777 • Economy"
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+@bot.tree.command(
+    name="daily",
+    description="Claim your daily coins and build a streak.",
+)
+async def daily(
+    interaction: discord.Interaction,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    success, value, streak, wallet = await asyncio.to_thread(
+        claim_daily_reward,
+        interaction.guild.id,
+        interaction.user.id,
+    )
+
+    if not success:
+        await interaction.response.send_message(
+            f"Your daily reward is not ready yet. "
+            f"Try again in **{format_cooldown(value)}**.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="🎁 Daily Reward",
+        description=(
+            f"You claimed **{format_coins(value)}**!\n"
+            f"Your streak is now **{streak} day(s)**."
+        ),
+        colour=GOLD_COLOUR,
+    )
+
+    embed.add_field(
+        name="Wallet",
+        value=format_coins(wallet),
+        inline=False,
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+@bot.tree.command(
+    name="work",
+    description="Work a job to earn coins.",
+)
+async def work(
+    interaction: discord.Interaction,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    success, value, wallet, job_name = await asyncio.to_thread(
+        perform_work,
+        interaction.guild.id,
+        interaction.user.id,
+    )
+
+    if not success:
+        await interaction.response.send_message(
+            f"You are tired. Work again in "
+            f"**{format_cooldown(value)}**.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="🛠️ Work Complete",
+        description=(
+            f"You **{job_name}** and earned "
+            f"**{format_coins(value)}**."
+        ),
+        colour=GOLD_COLOUR,
+    )
+
+    embed.add_field(
+        name="Wallet",
+        value=format_coins(wallet),
+        inline=False,
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+@bot.tree.command(
+    name="deposit",
+    description="Move coins from your wallet into your bank.",
+)
+@app_commands.describe(
+    amount="Number of coins to deposit."
+)
+async def deposit(
+    interaction: discord.Interaction,
+    amount: app_commands.Range[int, 1, 1_000_000_000],
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    success, account = await asyncio.to_thread(
+        transfer_wallet_bank,
+        interaction.guild.id,
+        interaction.user.id,
+        amount,
+        True,
+    )
+
+    if not success:
+        await interaction.response.send_message(
+            f"You only have {format_coins(account['wallet'])} "
+            f"in your wallet.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"🏦 Deposited **{format_coins(amount)}**.\n"
+        f"Wallet: **{format_coins(account['wallet'])}**\n"
+        f"Bank: **{format_coins(account['bank'])}**"
+    )
+
+
+@bot.tree.command(
+    name="withdraw",
+    description="Move coins from your bank into your wallet.",
+)
+@app_commands.describe(
+    amount="Number of coins to withdraw."
+)
+async def withdraw(
+    interaction: discord.Interaction,
+    amount: app_commands.Range[int, 1, 1_000_000_000],
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    success, account = await asyncio.to_thread(
+        transfer_wallet_bank,
+        interaction.guild.id,
+        interaction.user.id,
+        amount,
+        False,
+    )
+
+    if not success:
+        await interaction.response.send_message(
+            f"You only have {format_coins(account['bank'])} "
+            f"in your bank.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"💵 Withdrew **{format_coins(amount)}**.\n"
+        f"Wallet: **{format_coins(account['wallet'])}**\n"
+        f"Bank: **{format_coins(account['bank'])}**"
+    )
+
+
+@bot.tree.command(
+    name="pay",
+    description="Send wallet coins to another member.",
+)
+@app_commands.describe(
+    member="The member receiving the coins.",
+    amount="Number of coins to send.",
+)
+async def pay(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    amount: app_commands.Range[int, 1, 1_000_000_000],
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    if member.bot:
+        await interaction.response.send_message(
+            "You cannot pay a bot.",
+            ephemeral=True,
+        )
+        return
+
+    if member.id == interaction.user.id:
+        await interaction.response.send_message(
+            "You cannot pay yourself.",
+            ephemeral=True,
+        )
+        return
+
+    success, reason = await asyncio.to_thread(
+        pay_economy_user,
+        interaction.guild.id,
+        interaction.user.id,
+        member.id,
+        amount,
+    )
+
+    if not success:
+        await interaction.response.send_message(
+            "You do not have enough coins in your wallet.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"💸 {interaction.user.mention} paid "
+        f"{member.mention} **{format_coins(amount)}**."
+    )
+
+
+@bot.tree.command(
+    name="leaderboard",
+    description="View the richest members in the server.",
+)
+async def leaderboard(
+    interaction: discord.Interaction,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    rows = await asyncio.to_thread(
+        economy_leaderboard,
+        interaction.guild.id,
+        10,
+    )
+
+    if not rows:
+        await interaction.response.send_message(
+            "No economy accounts exist yet.",
+            ephemeral=True,
+        )
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+
+    for index, row in enumerate(rows):
+        member = interaction.guild.get_member(
+            row["user_id"]
+        )
+
+        member_name = (
+            member.display_name
+            if member
+            else f"User {row['user_id']}"
+        )
+
+        prefix = (
+            medals[index]
+            if index < len(medals)
+            else f"`#{index + 1}`"
+        )
+
+        lines.append(
+            f"{prefix} **{member_name}** — "
+            f"{format_coins(row['net_worth'])}"
+        )
+
+    embed = discord.Embed(
+        title="🏆 777 Rich List",
+        description="\n".join(lines),
+        colour=GOLD_COLOUR,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    embed.set_footer(
+        text="Wallet + bank combined"
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+@bot.tree.command(
+    name="slots",
+    description="Play animated 777 Royale Slots.",
+)
+@app_commands.describe(
+    bet="How many wallet coins to wager."
+)
+async def slots(
+    interaction: discord.Interaction,
+    bet: app_commands.Range[int, 1, 1_000_000_000],
+):
+    await execute_slots_spin(
+        interaction,
+        bet,
+    )
+
 
 @bot.tree.command(
     name="giveaway",
