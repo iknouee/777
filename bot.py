@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import random
+import time
 import textwrap
 import threading
 from datetime import datetime, timezone
@@ -2341,6 +2342,10 @@ class GiveawayView(discord.ui.View):
         self.message: discord.Message | None = None
         self.finished = False
         self.seconds_remaining = duration_seconds
+        self.ends_at_monotonic = time.monotonic() + duration_seconds
+        self.ends_at_unix = int(
+            datetime.now(timezone.utc).timestamp()
+        ) + duration_seconds
         self.countdown_task: asyncio.Task | None = None
         self.last_winners: list[discord.Member] = []
 
@@ -2425,7 +2430,10 @@ class GiveawayView(discord.ui.View):
         if not final:
             embed.add_field(
                 name="Time Remaining",
-                value=f"`{countdown_text(self.seconds_remaining)}`",
+                value=(
+                    f"`{countdown_text(self.seconds_remaining)}`\n"
+                    f"Ends <t:{self.ends_at_unix}:R>"
+                ),
                 inline=True,
             )
 
@@ -2494,47 +2502,88 @@ class GiveawayView(discord.ui.View):
         )
 
     async def start_countdown(self) -> None:
-        if self.countdown_task is None:
+        if (
+            self.countdown_task is None
+            or self.countdown_task.done()
+        ):
             self.countdown_task = asyncio.create_task(
-                self.countdown_loop()
+                self.countdown_loop(),
+                name=(
+                    f"777-giveaway-"
+                    f"{self.message.id if self.message else 'pending'}"
+                ),
+            )
+
+            logger.info(
+                "Started giveaway countdown for %s seconds.",
+                self.duration_seconds,
             )
 
     async def countdown_loop(self) -> None:
         try:
-            while not self.finished and self.seconds_remaining > 0:
-                interval = min(
-                    countdown_update_interval(
-                        self.seconds_remaining
-                    ),
-                    self.seconds_remaining,
-                )
+            last_displayed = None
 
-                await asyncio.sleep(interval)
-                self.seconds_remaining = max(
+            while not self.finished:
+                remaining = max(
                     0,
-                    self.seconds_remaining - interval,
+                    int(
+                        self.ends_at_monotonic
+                        - time.monotonic()
+                        + 0.999
+                    ),
                 )
 
-                if self.finished:
-                    return
+                self.seconds_remaining = remaining
 
-                if self.seconds_remaining == 0:
+                if remaining <= 0:
                     await self.finish_giveaway()
                     return
 
-                if self.message is not None:
+                if (
+                    self.message is not None
+                    and remaining != last_displayed
+                ):
                     try:
                         await self.message.edit(
                             embed=self.build_embed(),
                             view=self,
                         )
+                        last_displayed = remaining
+
+                    except discord.NotFound:
+                        self.finished = True
+                        self.stop()
+                        return
+
                     except discord.HTTPException:
-                        logger.exception(
-                            "Failed to update giveaway timer."
+                        logger.warning(
+                            "Giveaway timer update was rate limited "
+                            "or temporarily failed; it will retry."
                         )
+
+                # Update every second during the final minute.
+                # Earlier updates are spaced out to avoid Discord rate limits.
+                if remaining <= 60:
+                    sleep_for = 1
+                elif remaining <= 300:
+                    sleep_for = 5
+                else:
+                    sleep_for = 15
+
+                await asyncio.sleep(
+                    min(sleep_for, remaining)
+                )
 
         except asyncio.CancelledError:
             return
+
+        except Exception:
+            logger.exception(
+                "Unexpected error in giveaway countdown."
+            )
+
+            if not self.finished:
+                await self.finish_giveaway()
 
     async def select_winners(
         self,
@@ -2580,6 +2629,7 @@ class GiveawayView(discord.ui.View):
 
         self.finished = True
         self.seconds_remaining = 0
+        self.ends_at_monotonic = time.monotonic()
         self.stop()
 
         if (
