@@ -1217,8 +1217,296 @@ bot.tree.add_command(clip_message)
 
 
 # =========================================================
+# SMASH OR PASS
+# =========================================================
+
+class SmashOrPassView(discord.ui.View):
+    def __init__(
+        self,
+        target: discord.Member,
+        creator: discord.Member | discord.User,
+        duration_seconds: int = 60,
+    ):
+        super().__init__(timeout=duration_seconds)
+
+        self.target = target
+        self.creator = creator
+        self.duration_seconds = duration_seconds
+        self.smash_voters: set[int] = set()
+        self.pass_voters: set[int] = set()
+        self.message: discord.Message | None = None
+        self.finished = False
+
+    def totals_text(self) -> str:
+        smash_count = len(self.smash_voters)
+        pass_count = len(self.pass_voters)
+        total_votes = smash_count + pass_count
+
+        if total_votes == 0:
+            return (
+                "🔥 **Smash:** `0`\n"
+                "❌ **Pass:** `0`\n"
+                "No votes yet."
+            )
+
+        smash_percentage = round(
+            smash_count / total_votes * 100
+        )
+
+        pass_percentage = 100 - smash_percentage
+
+        return (
+            f"🔥 **Smash:** `{smash_count}` "
+            f"({smash_percentage}%)\n"
+            f"❌ **Pass:** `{pass_count}` "
+            f"({pass_percentage}%)\n"
+            f"🗳️ **Total votes:** `{total_votes}`"
+        )
+
+    def build_embed(
+        self,
+        final: bool = False,
+    ) -> discord.Embed:
+        smash_count = len(self.smash_voters)
+        pass_count = len(self.pass_voters)
+        total_votes = smash_count + pass_count
+
+        if final:
+            if total_votes == 0:
+                result_text = "No one voted this round."
+            elif smash_count > pass_count:
+                result_text = "🔥 **SMASH wins!**"
+            elif pass_count > smash_count:
+                result_text = "❌ **PASS wins!**"
+            else:
+                result_text = "⚖️ **It is a tie!**"
+
+            title = "🔥 Smash or Pass — Results"
+            description = (
+                f"Voting has ended for {self.target.mention}.\n\n"
+                f"{result_text}"
+            )
+
+        else:
+            title = "🔥 Smash or Pass"
+            description = (
+                f"What are we saying about {self.target.mention}?\n\n"
+                "Press a button below to vote.\n"
+                "**You can change your vote while voting is open.**"
+            )
+
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            colour=GOLD_COLOUR,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        embed.set_author(
+            name=self.target.display_name,
+            icon_url=self.target.display_avatar.url,
+        )
+
+        embed.set_image(
+            url=self.target.display_avatar.replace(
+                size=1024,
+                format="png",
+            ).url
+        )
+
+        embed.add_field(
+            name="Current Votes" if not final else "Final Votes",
+            value=self.totals_text(),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Started By",
+            value=self.creator.mention,
+            inline=True,
+        )
+
+        if not final:
+            embed.add_field(
+                name="Voting Time",
+                value=f"`{self.duration_seconds} seconds`",
+                inline=True,
+            )
+
+        embed.set_footer(
+            text=(
+                "777 • Smash or Pass"
+                if not final
+                else "777 • Voting closed"
+            )
+        )
+
+        return embed
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.bot:
+            await interaction.response.send_message(
+                "Bots cannot vote.",
+                ephemeral=True,
+            )
+            return False
+
+        if interaction.user.id == self.target.id:
+            await interaction.response.send_message(
+                "You cannot vote on yourself.",
+                ephemeral=True,
+            )
+            return False
+
+        if self.finished:
+            await interaction.response.send_message(
+                "Voting has already ended.",
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+    async def update_vote(
+        self,
+        interaction: discord.Interaction,
+        choice: str,
+    ) -> None:
+        user_id = interaction.user.id
+
+        if choice == "smash":
+            already_selected = user_id in self.smash_voters
+
+            self.pass_voters.discard(user_id)
+            self.smash_voters.add(user_id)
+
+            confirmation = (
+                "Your vote is still **🔥 Smash**."
+                if already_selected
+                else "You voted **🔥 Smash**."
+            )
+
+        else:
+            already_selected = user_id in self.pass_voters
+
+            self.smash_voters.discard(user_id)
+            self.pass_voters.add(user_id)
+
+            confirmation = (
+                "Your vote is still **❌ Pass**."
+                if already_selected
+                else "You voted **❌ Pass**."
+            )
+
+        await interaction.response.edit_message(
+            embed=self.build_embed(),
+            view=self,
+        )
+
+        await interaction.followup.send(
+            confirmation,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Smash",
+        emoji="🔥",
+        style=discord.ButtonStyle.success,
+    )
+    async def smash_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await self.update_vote(interaction, "smash")
+
+    @discord.ui.button(
+        label="Pass",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+    )
+    async def pass_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await self.update_vote(interaction, "pass")
+
+    async def on_timeout(self):
+        self.finished = True
+
+        for item in self.children:
+            item.disabled = True
+
+        if self.message is None:
+            return
+
+        try:
+            await self.message.edit(
+                embed=self.build_embed(final=True),
+                view=self,
+            )
+
+        except discord.HTTPException:
+            logger.exception(
+                "Failed to close a Smash or Pass vote."
+            )
+
+
+# =========================================================
 # SLASH COMMANDS
 # =========================================================
+
+@bot.tree.command(
+    name="smash_or_pass",
+    description="Start a Smash or Pass vote for a server member.",
+)
+@app_commands.describe(
+    member="The member everyone will vote on.",
+    duration="How long voting stays open, from 15 to 300 seconds.",
+)
+async def smash_or_pass(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    duration: app_commands.Range[int, 15, 300] = 60,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    if member.bot:
+        await interaction.response.send_message(
+            "You cannot start Smash or Pass for a bot.",
+            ephemeral=True,
+        )
+        return
+
+    if member.id == interaction.user.id:
+        await interaction.response.send_message(
+            "You cannot start Smash or Pass for yourself.",
+            ephemeral=True,
+        )
+        return
+
+    view = SmashOrPassView(
+        target=member,
+        creator=interaction.user,
+        duration_seconds=duration,
+    )
+
+    await interaction.response.send_message(
+        embed=view.build_embed(),
+        view=view,
+    )
+
+    view.message = await interaction.original_response()
+
 
 @bot.tree.command(
     name="ping",
@@ -1276,6 +1564,7 @@ async def about(
             "• Right-click message quoting\n"
             "• Right-click message clipping\n"
             "• `/clip` message-link command\n"
+            "• Smash or Pass button voting\n"
             "• Counting channel with streak tracking\n"
             "• `/counting`\n"
             "• `/ping`\n"
@@ -1301,6 +1590,16 @@ async def about(
             "Right-click a funny or memorable message and select:\n"
             "**Apps → Clip Message**\n\n"
             "777 will save it in the configured clips channel."
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Smash or Pass",
+        value=(
+            "Use `/smash_or_pass` and choose a server member.\n"
+            "Members vote with **🔥 Smash** or **❌ Pass** buttons, "
+            "and the final percentages appear when voting ends."
         ),
         inline=False,
     )
