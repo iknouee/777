@@ -3913,6 +3913,897 @@ async def execute_slots_spin(
 initialize_economy_database()
 
 
+
+# =========================================================
+# BLACKJACK
+# =========================================================
+
+BLACKJACK_MIN_BET = int(
+    os.getenv("BLACKJACK_MIN_BET", str(SLOTS_MIN_BET))
+)
+BLACKJACK_MAX_BET = int(
+    os.getenv("BLACKJACK_MAX_BET", str(SLOTS_MAX_BET))
+)
+
+CARD_SUITS = ["♠", "♥", "♦", "♣"]
+CARD_RANKS = [
+    "A", "2", "3", "4", "5", "6", "7",
+    "8", "9", "10", "J", "Q", "K",
+]
+
+
+def build_blackjack_deck() -> list[tuple[str, str]]:
+    deck = [
+        (rank, suit)
+        for suit in CARD_SUITS
+        for rank in CARD_RANKS
+    ]
+    random.shuffle(deck)
+    return deck
+
+
+def blackjack_hand_value(
+    hand: list[tuple[str, str]],
+) -> int:
+    value = 0
+    aces = 0
+
+    for rank, _ in hand:
+        if rank in {"J", "Q", "K"}:
+            value += 10
+        elif rank == "A":
+            value += 11
+            aces += 1
+        else:
+            value += int(rank)
+
+    while value > 21 and aces:
+        value -= 10
+        aces -= 1
+
+    return value
+
+
+def blackjack_is_natural(
+    hand: list[tuple[str, str]],
+) -> bool:
+    return (
+        len(hand) == 2
+        and blackjack_hand_value(hand) == 21
+    )
+
+
+def blackjack_card_text(
+    card: tuple[str, str],
+) -> str:
+    return f"{card[0]}{card[1]}"
+
+
+def blackjack_hand_text(
+    hand: list[tuple[str, str]],
+    hide_first: bool = False,
+) -> str:
+    cards = []
+
+    for index, card in enumerate(hand):
+        if hide_first and index == 0:
+            cards.append("🂠")
+        else:
+            cards.append(blackjack_card_text(card))
+
+    return "  ".join(cards)
+
+
+def draw_blackjack_card(
+    draw: ImageDraw.ImageDraw,
+    position: tuple[int, int],
+    card: tuple[str, str] | None,
+    hidden: bool = False,
+) -> None:
+    x, y = position
+    width = 145
+    height = 205
+    gold = (230, 180, 45)
+
+    draw.rounded_rectangle(
+        (x, y, x + width, y + height),
+        radius=18,
+        fill=(245, 242, 228),
+        outline=gold,
+        width=5,
+    )
+
+    if hidden or card is None:
+        draw.rounded_rectangle(
+            (x + 12, y + 12, x + width - 12, y + height - 12),
+            radius=14,
+            fill=(20, 20, 28),
+            outline=(120, 85, 15),
+            width=3,
+        )
+
+        small = get_slot_font(26, bold=True)
+        large = get_slot_font(64, bold=True)
+
+        draw.text(
+            (x + width // 2, y + 58),
+            "777",
+            font=large,
+            fill=gold,
+            anchor="mm",
+        )
+        draw.text(
+            (x + width // 2, y + 145),
+            "ROYAL",
+            font=small,
+            fill=gold,
+            anchor="mm",
+        )
+        return
+
+    rank, suit = card
+    red = suit in {"♥", "♦"}
+    colour = (190, 25, 35) if red else (18, 18, 22)
+
+    rank_font = get_slot_font(36, bold=True)
+    suit_font = get_slot_font(54, bold=True)
+    center_font = get_slot_font(78, bold=True)
+
+    draw.text(
+        (x + 18, y + 18),
+        rank,
+        font=rank_font,
+        fill=colour,
+    )
+    draw.text(
+        (x + 20, y + 58),
+        suit,
+        font=suit_font,
+        fill=colour,
+    )
+    draw.text(
+        (x + width // 2, y + height // 2 + 16),
+        suit,
+        font=center_font,
+        fill=colour,
+        anchor="mm",
+    )
+
+
+def create_blackjack_image(
+    player_name: str,
+    player_hand: list[tuple[str, str]],
+    dealer_hand: list[tuple[str, str]],
+    bet: int,
+    balance: int,
+    status: str,
+    hide_dealer: bool,
+) -> io.BytesIO:
+    width = 1400
+    height = 820
+
+    image = Image.new(
+        "RGB",
+        (width, height),
+        (6, 8, 8),
+    )
+    draw = ImageDraw.Draw(image)
+
+    gold = (235, 185, 45)
+    felt = (16, 73, 51)
+    felt_dark = (7, 42, 30)
+    light_gold = (255, 225, 135)
+    muted = (195, 198, 190)
+
+    draw.rounded_rectangle(
+        (28, 28, width - 28, height - 28),
+        radius=42,
+        fill=(18, 18, 23),
+        outline=gold,
+        width=8,
+    )
+
+    draw.rounded_rectangle(
+        (60, 72, width - 60, height - 65),
+        radius=110,
+        fill=felt,
+        outline=(100, 76, 15),
+        width=6,
+    )
+
+    draw.rounded_rectangle(
+        (96, 106, width - 96, height - 100),
+        radius=90,
+        outline=felt_dark,
+        width=5,
+    )
+
+    title_font = get_slot_font(56, bold=True)
+    header_font = get_slot_font(30, bold=True)
+    info_font = get_slot_font(27, bold=True)
+    small_font = get_slot_font(22, bold=False)
+
+    draw.text(
+        (width // 2, 74),
+        "777 ROYALE BLACKJACK",
+        font=title_font,
+        fill=light_gold,
+        anchor="mm",
+    )
+
+    draw.text(
+        (width // 2, 132),
+        status,
+        font=header_font,
+        fill=gold,
+        anchor="mm",
+    )
+
+    dealer_value = (
+        "?"
+        if hide_dealer
+        else str(blackjack_hand_value(dealer_hand))
+    )
+
+    draw.text(
+        (120, 182),
+        f"DEALER  •  VALUE {dealer_value}",
+        font=header_font,
+        fill=(245, 245, 240),
+    )
+
+    card_gap = 165
+    dealer_start = 150
+
+    for index, card in enumerate(dealer_hand):
+        draw_blackjack_card(
+            draw,
+            (dealer_start + index * card_gap, 225),
+            card,
+            hidden=(hide_dealer and index == 0),
+        )
+
+    player_value = blackjack_hand_value(player_hand)
+
+    draw.text(
+        (120, 485),
+        f"{player_name[:28].upper()}  •  VALUE {player_value}",
+        font=header_font,
+        fill=(245, 245, 240),
+    )
+
+    for index, card in enumerate(player_hand):
+        draw_blackjack_card(
+            draw,
+            (dealer_start + index * card_gap, 525),
+            card,
+        )
+
+    panel_x = 1040
+
+    draw.rounded_rectangle(
+        (panel_x, 215, 1290, 630),
+        radius=28,
+        fill=(12, 31, 24),
+        outline=gold,
+        width=4,
+    )
+
+    details = [
+        ("BET", format_coins(bet)),
+        ("BALANCE", format_coins(balance)),
+        ("PLAYER", str(player_value)),
+        ("DEALER", dealer_value),
+    ]
+
+    detail_y = 270
+
+    for label, value in details:
+        draw.text(
+            (1165, detail_y),
+            label,
+            font=small_font,
+            fill=muted,
+            anchor="mm",
+        )
+        draw.text(
+            (1165, detail_y + 38),
+            value,
+            font=info_font,
+            fill=light_gold,
+            anchor="mm",
+        )
+        detail_y += 88
+
+    draw.text(
+        (width // 2, 772),
+        "BLACKJACK PAYS 3:2  •  DEALER STANDS ON 17  •  777",
+        font=small_font,
+        fill=muted,
+        anchor="mm",
+    )
+
+    output = io.BytesIO()
+    image.save(
+        output,
+        format="PNG",
+        optimize=True,
+    )
+    output.seek(0)
+    return output
+
+
+active_blackjack_games: dict[
+    tuple[int, int],
+    "BlackjackView",
+] = {}
+
+
+class BlackjackView(discord.ui.View):
+    def __init__(
+        self,
+        guild_id: int,
+        player_id: int,
+        player_name: str,
+        bet: int,
+        deck: list[tuple[str, str]],
+        player_hand: list[tuple[str, str]],
+        dealer_hand: list[tuple[str, str]],
+        balance_after_bet: int,
+    ):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.player_id = player_id
+        self.player_name = player_name
+        self.bet = bet
+        self.deck = deck
+        self.player_hand = player_hand
+        self.dealer_hand = dealer_hand
+        self.balance_after_bet = balance_after_bet
+        self.message: discord.Message | None = None
+        self.finished = False
+        self.action_lock = asyncio.Lock()
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id != self.player_id:
+            await interaction.response.send_message(
+                "This blackjack table belongs to another player.",
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+    def disable_all(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+    async def render(
+        self,
+        interaction: discord.Interaction,
+        status: str,
+        hide_dealer: bool = True,
+        result_description: str | None = None,
+    ) -> None:
+        image = await asyncio.to_thread(
+            create_blackjack_image,
+            self.player_name,
+            self.player_hand,
+            self.dealer_hand,
+            self.bet,
+            self.balance_after_bet,
+            status,
+            hide_dealer,
+        )
+
+        filename = (
+            f"777_blackjack_{self.player_id}_"
+            f"{int(time.time())}.png"
+        )
+
+        file = discord.File(
+            image,
+            filename=filename,
+        )
+
+        embed = discord.Embed(
+            title="🃏 777 Royale Blackjack",
+            description=(
+                result_description
+                or (
+                    f"**Your hand:** "
+                    f"{blackjack_hand_text(self.player_hand)}\n"
+                    f"**Dealer:** "
+                    f"{blackjack_hand_text(self.dealer_hand, True)}"
+                )
+            ),
+            colour=GOLD_COLOUR,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        embed.set_image(
+            url=f"attachment://{filename}"
+        )
+
+        embed.add_field(
+            name="Bet",
+            value=format_coins(self.bet),
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Your Value",
+            value=str(
+                blackjack_hand_value(self.player_hand)
+            ),
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Wallet",
+            value=format_coins(self.balance_after_bet),
+            inline=True,
+        )
+
+        embed.set_footer(
+            text="777 • Hit, Stand, or Double Down"
+        )
+
+        await interaction.edit_original_response(
+            embed=embed,
+            attachments=[file],
+            view=self,
+        )
+
+    async def finish_game(
+        self,
+        interaction: discord.Interaction,
+        outcome: str,
+        payout: int,
+        status: str,
+    ) -> None:
+        if self.finished:
+            return
+
+        self.finished = True
+        self.disable_all()
+        self.stop()
+
+        if payout > 0:
+            _, self.balance_after_bet = await asyncio.to_thread(
+                change_wallet,
+                self.guild_id,
+                self.player_id,
+                payout,
+                "blackjack_payout",
+                (
+                    f"bet={self.bet};"
+                    f"outcome={outcome};"
+                    f"payout={payout}"
+                ),
+            )
+
+        player_value = blackjack_hand_value(
+            self.player_hand
+        )
+        dealer_value = blackjack_hand_value(
+            self.dealer_hand
+        )
+
+        image = await asyncio.to_thread(
+            create_blackjack_image,
+            self.player_name,
+            self.player_hand,
+            self.dealer_hand,
+            self.bet,
+            self.balance_after_bet,
+            status,
+            False,
+        )
+
+        filename = (
+            f"777_blackjack_final_{self.player_id}_"
+            f"{int(time.time())}.png"
+        )
+
+        file = discord.File(
+            image,
+            filename=filename,
+        )
+
+        net = payout - self.bet
+
+        if net > 0:
+            result_line = (
+                f"## 🎉 You won {format_coins(net)} profit!"
+            )
+        elif net == 0:
+            result_line = "## 🤝 Push — your bet was returned."
+        else:
+            result_line = (
+                f"## 💸 You lost {format_coins(abs(net))}."
+            )
+
+        embed = discord.Embed(
+            title="🃏 Blackjack Result",
+            description=(
+                f"{result_line}\n\n"
+                f"**Outcome:** {outcome}\n"
+                f"**Your hand:** "
+                f"{blackjack_hand_text(self.player_hand)} "
+                f"(**{player_value}**)\n"
+                f"**Dealer hand:** "
+                f"{blackjack_hand_text(self.dealer_hand)} "
+                f"(**{dealer_value}**)"
+            ),
+            colour=GOLD_COLOUR,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        embed.set_image(
+            url=f"attachment://{filename}"
+        )
+
+        embed.add_field(
+            name="Bet",
+            value=format_coins(self.bet),
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Payout",
+            value=format_coins(payout),
+            inline=True,
+        )
+
+        embed.add_field(
+            name="New Wallet",
+            value=format_coins(self.balance_after_bet),
+            inline=True,
+        )
+
+        embed.set_footer(
+            text="777 • Royale Casino • Play responsibly"
+        )
+
+        try:
+            await interaction.edit_original_response(
+                embed=embed,
+                attachments=[file],
+                view=self,
+            )
+        finally:
+            active_blackjack_games.pop(
+                (self.guild_id, self.player_id),
+                None,
+            )
+
+    async def dealer_play_and_finish(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        while blackjack_hand_value(self.dealer_hand) < 17:
+            await asyncio.sleep(0.65)
+            self.dealer_hand.append(self.deck.pop())
+
+        player_value = blackjack_hand_value(
+            self.player_hand
+        )
+        dealer_value = blackjack_hand_value(
+            self.dealer_hand
+        )
+
+        if dealer_value > 21:
+            await self.finish_game(
+                interaction,
+                "Dealer busted",
+                self.bet * 2,
+                "DEALER BUST",
+            )
+        elif player_value > dealer_value:
+            await self.finish_game(
+                interaction,
+                "You beat the dealer",
+                self.bet * 2,
+                "PLAYER WINS",
+            )
+        elif player_value == dealer_value:
+            await self.finish_game(
+                interaction,
+                "Push",
+                self.bet,
+                "PUSH",
+            )
+        else:
+            await self.finish_game(
+                interaction,
+                "Dealer wins",
+                0,
+                "DEALER WINS",
+            )
+
+    @discord.ui.button(
+        label="Hit",
+        emoji="🃏",
+        style=discord.ButtonStyle.success,
+    )
+    async def hit(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        async with self.action_lock:
+            if self.finished:
+                await interaction.response.send_message(
+                    "This blackjack game has already ended.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer()
+            self.player_hand.append(self.deck.pop())
+            value = blackjack_hand_value(
+                self.player_hand
+            )
+
+            if value > 21:
+                await self.finish_game(
+                    interaction,
+                    "You busted",
+                    0,
+                    "PLAYER BUST",
+                )
+            elif value == 21:
+                await self.dealer_play_and_finish(
+                    interaction
+                )
+            else:
+                await self.render(
+                    interaction,
+                    "YOUR MOVE",
+                )
+
+    @discord.ui.button(
+        label="Stand",
+        emoji="✋",
+        style=discord.ButtonStyle.primary,
+    )
+    async def stand(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        async with self.action_lock:
+            if self.finished:
+                await interaction.response.send_message(
+                    "This blackjack game has already ended.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer()
+            await self.dealer_play_and_finish(
+                interaction
+            )
+
+    @discord.ui.button(
+        label="Double Down",
+        emoji="⚡",
+        style=discord.ButtonStyle.danger,
+    )
+    async def double_down(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        async with self.action_lock:
+            if self.finished:
+                await interaction.response.send_message(
+                    "This blackjack game has already ended.",
+                    ephemeral=True,
+                )
+                return
+
+            if len(self.player_hand) != 2:
+                await interaction.response.send_message(
+                    "Double Down is only available on your first move.",
+                    ephemeral=True,
+                )
+                return
+
+            account = await asyncio.to_thread(
+                get_economy_account,
+                self.guild_id,
+                self.player_id,
+            )
+
+            if account["wallet"] < self.bet:
+                await interaction.response.send_message(
+                    f"You need another {format_coins(self.bet)} "
+                    f"to double down.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer()
+
+            charged, new_balance = await asyncio.to_thread(
+                change_wallet,
+                self.guild_id,
+                self.player_id,
+                -self.bet,
+                "blackjack_double_down",
+                f"original_bet={self.bet}",
+            )
+
+            if not charged:
+                await interaction.followup.send(
+                    "Your balance changed before the double down completed.",
+                    ephemeral=True,
+                )
+                return
+
+            self.bet *= 2
+            self.balance_after_bet = new_balance
+            self.player_hand.append(self.deck.pop())
+
+            if blackjack_hand_value(self.player_hand) > 21:
+                await self.finish_game(
+                    interaction,
+                    "You busted after doubling down",
+                    0,
+                    "DOUBLE DOWN BUST",
+                )
+            else:
+                await self.dealer_play_and_finish(
+                    interaction
+                )
+
+    async def on_timeout(self):
+        if self.finished:
+            return
+
+        self.finished = True
+        self.disable_all()
+        active_blackjack_games.pop(
+            (self.guild_id, self.player_id),
+            None,
+        )
+
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+async def start_blackjack_game(
+    interaction: discord.Interaction,
+    bet: int,
+) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Blackjack can only be played inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    if bet < BLACKJACK_MIN_BET or bet > BLACKJACK_MAX_BET:
+        await interaction.response.send_message(
+            f"Your bet must be between "
+            f"{format_coins(BLACKJACK_MIN_BET)} and "
+            f"{format_coins(BLACKJACK_MAX_BET)}.",
+            ephemeral=True,
+        )
+        return
+
+    key = (
+        interaction.guild.id,
+        interaction.user.id,
+    )
+
+    if key in active_blackjack_games:
+        await interaction.response.send_message(
+            "You already have an active blackjack game.",
+            ephemeral=True,
+        )
+        return
+
+    account = await asyncio.to_thread(
+        get_economy_account,
+        interaction.guild.id,
+        interaction.user.id,
+    )
+
+    if account["wallet"] < bet:
+        await interaction.response.send_message(
+            f"You need {format_coins(bet)} in your wallet, "
+            f"but you only have {format_coins(account['wallet'])}.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+
+    charged, balance_after_bet = await asyncio.to_thread(
+        change_wallet,
+        interaction.guild.id,
+        interaction.user.id,
+        -bet,
+        "blackjack_bet",
+        f"bet={bet}",
+    )
+
+    if not charged:
+        await interaction.followup.send(
+            "Your balance changed before the game started.",
+            ephemeral=True,
+        )
+        return
+
+    deck = build_blackjack_deck()
+    player_hand = [deck.pop(), deck.pop()]
+    dealer_hand = [deck.pop(), deck.pop()]
+
+    view = BlackjackView(
+        interaction.guild.id,
+        interaction.user.id,
+        interaction.user.display_name,
+        bet,
+        deck,
+        player_hand,
+        dealer_hand,
+        balance_after_bet,
+    )
+
+    active_blackjack_games[key] = view
+
+    player_natural = blackjack_is_natural(
+        player_hand
+    )
+    dealer_natural = blackjack_is_natural(
+        dealer_hand
+    )
+
+    if player_natural or dealer_natural:
+        if player_natural and dealer_natural:
+            await view.finish_game(
+                interaction,
+                "Both have blackjack — push",
+                bet,
+                "DOUBLE BLACKJACK",
+            )
+        elif player_natural:
+            payout = int(round(bet * 2.5))
+            await view.finish_game(
+                interaction,
+                "Natural blackjack",
+                payout,
+                "BLACKJACK!",
+            )
+        else:
+            await view.finish_game(
+                interaction,
+                "Dealer has blackjack",
+                0,
+                "DEALER BLACKJACK",
+            )
+        return
+
+    await view.render(
+        interaction,
+        "YOUR MOVE",
+    )
+
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException:
+        view.message = None
+
+
 # =========================================================
 # SLASH COMMANDS
 # =========================================================
@@ -4309,6 +5200,23 @@ async def slots(
     bet: app_commands.Range[int, 1, 1_000_000_000],
 ):
     await execute_slots_spin(
+        interaction,
+        bet,
+    )
+
+
+@bot.tree.command(
+    name="blackjack",
+    description="Play interactive 777 Royale Blackjack.",
+)
+@app_commands.describe(
+    bet="How many wallet coins to wager."
+)
+async def blackjack(
+    interaction: discord.Interaction,
+    bet: app_commands.Range[int, 1, 1_000_000_000],
+):
+    await start_blackjack_game(
         interaction,
         bet,
     )
