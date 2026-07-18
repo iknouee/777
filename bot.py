@@ -39,6 +39,12 @@ VERIFY_CHANNEL_ID = os.getenv("VERIFY_CHANNEL_ID")
 VERIFIED_ROLE_ID = os.getenv("VERIFIED_ROLE_ID")
 VERIFY_CODE_EXPIRY_SECONDS = int(os.getenv("VERIFY_CODE_EXPIRY_SECONDS", "600"))
 VERIFY_CLEANUP_INTERVAL_SECONDS = int(os.getenv("VERIFY_CLEANUP_INTERVAL_SECONDS", "300"))
+APPLICATION_CHANNEL_ID = os.getenv("APPLICATION_CHANNEL_ID")
+APPLICATION_LOGS_CHANNEL_ID = os.getenv("APPLICATION_LOGS_CHANNEL_ID")
+STAFF_APPLICATION_CHANNEL_ID = os.getenv("STAFF_APPLICATION_CHANNEL_ID")
+STAFF_APPLICATION_LOGS_CHANNEL_ID = os.getenv("STAFF_APPLICATION_LOGS_CHANNEL_ID")
+FRIEND_GROUP_ROLE_ID = os.getenv("FRIEND_GROUP_ROLE_ID")
+STAFF_ROLE_ID = os.getenv("STAFF_ROLE_ID")
 ECONOMY_DB_PATH = os.getenv("ECONOMY_DB_PATH", "economy.db")
 ECONOMY_STARTING_BALANCE = int(
     os.getenv("ECONOMY_STARTING_BALANCE", "500")
@@ -1124,6 +1130,333 @@ async def handle_verification_code(message: discord.Message) -> bool:
     return True
 
 
+
+# =========================================================
+# APPLICATION SYSTEM
+# =========================================================
+
+APPLICATION_EMBED_FOOTER = "777 • Friend Group Applications"
+STAFF_APPLICATION_EMBED_FOOTER = "777 • Staff Applications"
+application_setup_lock = asyncio.Lock()
+
+
+def configured_id(value: str | None, name: str) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("%s must contain only numbers.", name)
+        return None
+
+
+def application_config(staff: bool = False) -> tuple[int | None, int | None, int | None]:
+    if staff:
+        return (
+            configured_id(STAFF_APPLICATION_CHANNEL_ID, "STAFF_APPLICATION_CHANNEL_ID"),
+            configured_id(STAFF_APPLICATION_LOGS_CHANNEL_ID, "STAFF_APPLICATION_LOGS_CHANNEL_ID"),
+            configured_id(STAFF_ROLE_ID, "STAFF_ROLE_ID"),
+        )
+    return (
+        configured_id(APPLICATION_CHANNEL_ID, "APPLICATION_CHANNEL_ID"),
+        configured_id(APPLICATION_LOGS_CHANNEL_ID, "APPLICATION_LOGS_CHANNEL_ID"),
+        configured_id(FRIEND_GROUP_ROLE_ID, "FRIEND_GROUP_ROLE_ID"),
+    )
+
+
+def application_panel_embed(staff: bool = False) -> discord.Embed:
+    if staff:
+        embed = discord.Embed(
+            title="🛡️ 777 Staff Applications",
+            description=(
+                "Think you can help keep **777** active, safe and enjoyable?\n\n"
+                "Press **Apply for Staff** below and answer every question honestly. "
+                "Low-effort, copied or joke applications will be denied.\n\n"
+                "**Before applying:**\n"
+                "• Be active and mature\n"
+                "• Understand the server rules\n"
+                "• Be able to handle conflict calmly\n"
+                "• Never abuse staff permissions"
+            ),
+            colour=GOLD_COLOUR,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="Review process", value="Your answers are privately sent to the staff review channel.", inline=False)
+        embed.set_footer(text=STAFF_APPLICATION_EMBED_FOOTER)
+    else:
+        embed = discord.Embed(
+            title="👑 Apply to Join 777",
+            description=(
+                "Want to officially join the **777 friend group**?\n\n"
+                "Press **Apply to 777** below and complete the application. If accepted, "
+                "you must change your Roblox display name to the agreed **777name** format "
+                "(for example, `777ben`).\n\n"
+                "Applications should be genuine, detailed and respectful."
+            ),
+            colour=GOLD_COLOUR,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="Name requirement", value="Your Roblox **display name** must begin with `777` after acceptance.", inline=False)
+        embed.add_field(name="Privacy", value="Your answers are only posted in the private 777 application logs channel.", inline=False)
+        embed.set_footer(text=APPLICATION_EMBED_FOOTER)
+    if BANNER_URL:
+        embed.set_image(url=BANNER_URL)
+    return embed
+
+
+async def send_temporary(interaction: discord.Interaction, text: str) -> None:
+    if interaction.response.is_done():
+        await interaction.followup.send(text, ephemeral=True)
+    else:
+        await interaction.response.send_message(text, ephemeral=True)
+
+
+def extract_applicant_id(embed: discord.Embed) -> int | None:
+    for field in embed.fields:
+        if field.name == "Applicant ID":
+            try:
+                return int(field.value.strip("`"))
+            except (ValueError, AttributeError):
+                return None
+    return None
+
+
+class ApplicationReviewView(discord.ui.View):
+    def __init__(self, staff: bool = False):
+        super().__init__(timeout=None)
+        self.staff = staff
+
+    async def review(self, interaction: discord.Interaction, accepted: bool) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await send_temporary(interaction, "This can only be reviewed inside the server.")
+            return
+        if not interaction.user.guild_permissions.manage_roles:
+            await send_temporary(interaction, "You need **Manage Roles** to review applications.")
+            return
+        if not interaction.message or not interaction.message.embeds:
+            await send_temporary(interaction, "I could not read this application.")
+            return
+
+        embed = interaction.message.embeds[0]
+        applicant_id = extract_applicant_id(embed)
+        if applicant_id is None:
+            await send_temporary(interaction, "The applicant ID is missing from this application.")
+            return
+
+        member = interaction.guild.get_member(applicant_id)
+        _, _, role_id = application_config(self.staff)
+        role = interaction.guild.get_role(role_id) if role_id else None
+
+        await interaction.response.defer(ephemeral=True)
+        status = "Accepted" if accepted else "Denied"
+        status_icon = "✅" if accepted else "❌"
+
+        if accepted and member is not None and role is not None:
+            try:
+                await member.add_roles(role, reason=f"777 application accepted by {interaction.user}")
+            except discord.Forbidden:
+                await interaction.followup.send("I cannot give the configured role. Put my bot role above it.", ephemeral=True)
+                return
+            except discord.HTTPException:
+                await interaction.followup.send("Discord failed to add the role. Try again.", ephemeral=True)
+                return
+
+        updated = embed.copy()
+        updated.colour = discord.Colour.green() if accepted else discord.Colour.red()
+        updated.add_field(name="Decision", value=f"{status_icon} **{status}** by {interaction.user.mention}", inline=False)
+        updated.set_footer(text=f"777 • {status} application")
+
+        for item in self.children:
+            item.disabled = True
+        await interaction.message.edit(embed=updated, view=self)
+
+        if member is not None:
+            try:
+                if accepted and self.staff:
+                    dm_text = f"✅ Your **777 staff application** in **{interaction.guild.name}** was accepted. Welcome to the team!"
+                elif accepted:
+                    dm_text = (
+                        f"✅ Your application to join **777** in **{interaction.guild.name}** was accepted! "
+                        "Please now change your Roblox display name to the `777name` you submitted."
+                    )
+                else:
+                    dm_text = f"❌ Your {'staff ' if self.staff else ''}application in **{interaction.guild.name}** was not accepted this time."
+                await member.send(dm_text)
+            except discord.HTTPException:
+                pass
+
+        role_note = ""
+        if accepted and role is None:
+            role_note = " The application was accepted, but no role is configured."
+        elif accepted and member is None:
+            role_note = " The applicant is no longer in the server, so no role was added."
+        await interaction.followup.send(f"Application marked **{status}**.{role_note}", ephemeral=True)
+
+    @discord.ui.button(label="Accept", emoji="✅", style=discord.ButtonStyle.success, custom_id="777_friend_application_accept")
+    async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.review(interaction, True)
+
+    @discord.ui.button(label="Deny", emoji="❌", style=discord.ButtonStyle.danger, custom_id="777_friend_application_deny")
+    async def deny_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.review(interaction, False)
+
+
+class StaffApplicationReviewView(ApplicationReviewView):
+    def __init__(self):
+        super().__init__(staff=True)
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                if item.custom_id == "777_friend_application_accept":
+                    item.custom_id = "777_staff_application_accept"
+                elif item.custom_id == "777_friend_application_deny":
+                    item.custom_id = "777_staff_application_deny"
+
+
+async def submit_application(interaction: discord.Interaction, answers: list[tuple[str, str]], staff: bool) -> None:
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Applications can only be submitted inside the server.", ephemeral=True)
+        return
+
+    application_channel_id, logs_channel_id, _ = application_config(staff)
+    if application_channel_id is None or logs_channel_id is None:
+        await interaction.response.send_message("This application system has not been configured yet.", ephemeral=True)
+        return
+    if interaction.channel_id != application_channel_id:
+        await interaction.response.send_message(f"Apply in <#{application_channel_id}>.", ephemeral=True)
+        return
+
+    logs_channel = interaction.guild.get_channel(logs_channel_id)
+    if not isinstance(logs_channel, discord.TextChannel):
+        await interaction.response.send_message("The application logs channel could not be found.", ephemeral=True)
+        return
+
+    # Avoid duplicate pending applications from the same user in recent logs.
+    try:
+        async for old_message in logs_channel.history(limit=100):
+            if old_message.author.id != bot.user.id or not old_message.embeds:
+                continue
+            old_embed = old_message.embeds[0]
+            if extract_applicant_id(old_embed) == interaction.user.id and not any(f.name == "Decision" for f in old_embed.fields):
+                await interaction.response.send_message("You already have a pending application. Wait for staff to review it.", ephemeral=True)
+                return
+    except discord.Forbidden:
+        pass
+
+    embed = discord.Embed(
+        title="🛡️ New 777 Staff Application" if staff else "👑 New 777 Friend Group Application",
+        description=f"Application submitted by {interaction.user.mention}",
+        colour=GOLD_COLOUR,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    embed.add_field(name="Applicant", value=interaction.user.mention, inline=True)
+    embed.add_field(name="Applicant ID", value=f"`{interaction.user.id}`", inline=True)
+    embed.add_field(name="Account created", value=discord.utils.format_dt(interaction.user.created_at, style="R"), inline=True)
+    embed.add_field(name="Joined server", value=discord.utils.format_dt(interaction.user.joined_at, style="R") if interaction.user.joined_at else "Unknown", inline=True)
+    for question, answer in answers:
+        embed.add_field(name=question, value=answer[:1024], inline=False)
+    embed.set_footer(text="777 • Awaiting staff review")
+
+    view = StaffApplicationReviewView() if staff else ApplicationReviewView()
+    try:
+        await logs_channel.send(embed=embed, view=view)
+    except discord.Forbidden:
+        await interaction.response.send_message("I cannot post in the configured logs channel.", ephemeral=True)
+        return
+    await interaction.response.send_message("✅ Your application was submitted privately. Staff will review it soon.", ephemeral=True)
+
+
+class FriendApplicationModal(discord.ui.Modal, title="Apply to Join 777"):
+    roblox_username = discord.ui.TextInput(label="Roblox username", placeholder="Your exact Roblox username", max_length=40)
+    display_name = discord.ui.TextInput(label="Your new 777 display name", placeholder="Example: 777ben", min_length=4, max_length=20)
+    about_you = discord.ui.TextInput(label="Tell us about yourself", style=discord.TextStyle.paragraph, min_length=20, max_length=500)
+    why_join = discord.ui.TextInput(label="Why do you want to join 777?", style=discord.TextStyle.paragraph, min_length=20, max_length=500)
+    activity = discord.ui.TextInput(label="How active are you?", placeholder="Timezone, days and usual hours", max_length=200)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        desired = str(self.display_name).strip()
+        if not desired.lower().startswith("777"):
+            await interaction.response.send_message("Your Roblox display name must begin with `777`, such as `777ben`.", ephemeral=True)
+            return
+        await submit_application(interaction, [
+            ("Roblox username", str(self.roblox_username)),
+            ("Agreed Roblox display name", desired),
+            ("About them", str(self.about_you)),
+            ("Why they want to join", str(self.why_join)),
+            ("Activity / timezone", str(self.activity)),
+        ], staff=False)
+
+
+class StaffApplicationModal(discord.ui.Modal, title="777 Staff Application"):
+    age_timezone = discord.ui.TextInput(label="Age range and timezone", placeholder="Example: 16-17, UK time", max_length=100)
+    experience = discord.ui.TextInput(label="Previous staff experience", style=discord.TextStyle.paragraph, min_length=20, max_length=500)
+    motivation = discord.ui.TextInput(label="Why should we choose you?", style=discord.TextStyle.paragraph, min_length=30, max_length=500)
+    scenario = discord.ui.TextInput(label="How would you handle two friends arguing?", style=discord.TextStyle.paragraph, min_length=30, max_length=500)
+    availability = discord.ui.TextInput(label="Availability and activity", placeholder="Days, hours and how often you are online", max_length=200)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await submit_application(interaction, [
+            ("Age range / timezone", str(self.age_timezone)),
+            ("Previous experience", str(self.experience)),
+            ("Why they should be chosen", str(self.motivation)),
+            ("Conflict scenario answer", str(self.scenario)),
+            ("Availability", str(self.availability)),
+        ], staff=True)
+
+
+class FriendApplicationPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Apply to 777", emoji="👑", style=discord.ButtonStyle.primary, custom_id="777_open_friend_application")
+    async def apply_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel_id, _, role_id = application_config(False)
+        if interaction.channel_id != channel_id:
+            await send_temporary(interaction, f"Use this button in <#{channel_id}>.")
+            return
+        if isinstance(interaction.user, discord.Member) and role_id and interaction.user.get_role(role_id):
+            await send_temporary(interaction, "You are already a member of the 777 friend group.")
+            return
+        await interaction.response.send_modal(FriendApplicationModal())
+
+
+class StaffApplicationPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Apply for Staff", emoji="🛡️", style=discord.ButtonStyle.primary, custom_id="777_open_staff_application")
+    async def apply_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel_id, _, role_id = application_config(True)
+        if interaction.channel_id != channel_id:
+            await send_temporary(interaction, f"Use this button in <#{channel_id}>.")
+            return
+        if isinstance(interaction.user, discord.Member) and role_id and interaction.user.get_role(role_id):
+            await send_temporary(interaction, "You already have the configured staff role.")
+            return
+        await interaction.response.send_modal(StaffApplicationModal())
+
+
+async def ensure_application_panel(staff: bool = False) -> None:
+    channel_id, _, _ = application_config(staff)
+    if channel_id is None:
+        return
+    channel = bot.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    footer = STAFF_APPLICATION_EMBED_FOOTER if staff else APPLICATION_EMBED_FOOTER
+    async with application_setup_lock:
+        try:
+            async for message in channel.history(limit=100):
+                if message.author.id == bot.user.id and message.embeds and message.embeds[0].footer and message.embeds[0].footer.text == footer:
+                    return
+            await channel.send(embed=application_panel_embed(staff), view=StaffApplicationPanel() if staff else FriendApplicationPanel())
+        except discord.Forbidden:
+            logger.warning("Missing permission to create application panel in %s.", channel.id)
+        except discord.HTTPException:
+            logger.exception("Failed to create application panel.")
+
+
 # =========================================================
 # BOT EVENTS
 # =========================================================
@@ -1157,6 +1490,17 @@ async def on_ready():
             verification_cleanup_loop(),
             name="777-verification-cleanup",
         )
+
+    # Persistent application buttons survive bot restarts.
+    if not getattr(bot, "_777_application_views_added", False):
+        bot.add_view(FriendApplicationPanel())
+        bot.add_view(StaffApplicationPanel())
+        bot.add_view(ApplicationReviewView())
+        bot.add_view(StaffApplicationReviewView())
+        bot._777_application_views_added = True
+
+    await ensure_application_panel(False)
+    await ensure_application_panel(True)
 
     await bot.change_presence(
         status=discord.Status.online,
