@@ -4804,6 +4804,779 @@ async def start_blackjack_game(
         view.message = None
 
 
+
+# =========================================================
+# FULL ECONOMY SUITE
+# Roulette • Shop • Inventory • Crates • Minigames
+# Achievements • Profiles • Prestige
+# =========================================================
+
+FULL_ECONOMY_SHOP = {
+    "lucky_clover": {
+        "name": "Lucky Clover",
+        "emoji": "🍀",
+        "price": 2500,
+        "sell": 1250,
+        "description": "Small passive bonus to gambling payouts.",
+        "consumable": False,
+    },
+    "golden_ticket": {
+        "name": "Golden Ticket",
+        "emoji": "🎟️",
+        "price": 1800,
+        "sell": 900,
+        "description": "Use it for an instant coin reward.",
+        "consumable": True,
+    },
+    "mystery_crate": {
+        "name": "Mystery Crate",
+        "emoji": "📦",
+        "price": 3000,
+        "sell": 1200,
+        "description": "Open it for coins or rare loot.",
+        "consumable": True,
+    },
+    "vault_key": {
+        "name": "Vault Key",
+        "emoji": "🗝️",
+        "price": 7500,
+        "sell": 3500,
+        "description": "A prestigious collector item.",
+        "consumable": False,
+    },
+    "xp_boost": {
+        "name": "XP Boost",
+        "emoji": "⚡",
+        "price": 1500,
+        "sell": 650,
+        "description": "Use it to gain instant economy XP.",
+        "consumable": True,
+    },
+}
+
+ACHIEVEMENT_DEFINITIONS = {
+    "first_win": ("First Win", "Win any tracked game."),
+    "high_roller": ("High Roller", "Place a bet of 5,000 coins or more."),
+    "millionaire": ("Millionaire", "Reach a net worth of 1,000,000 coins."),
+    "daily_7": ("Weekly Grinder", "Reach a 7-day daily streak."),
+    "prestige_1": ("Reborn", "Prestige for the first time."),
+    "collector": ("Collector", "Own at least 5 total shop items."),
+}
+
+MINIGAME_COOLDOWNS = {
+    "fish": 60,
+    "mine": 90,
+    "hunt": 120,
+    "crime": 180,
+    "heist": 600,
+}
+
+
+def initialize_full_economy_tables() -> None:
+    with economy_lock, economy_connection() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS economy_inventory (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                item_key TEXT NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id, item_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS economy_stats (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                xp INTEGER NOT NULL DEFAULT 0,
+                level INTEGER NOT NULL DEFAULT 1,
+                prestige INTEGER NOT NULL DEFAULT 0,
+                games_won INTEGER NOT NULL DEFAULT 0,
+                games_lost INTEGER NOT NULL DEFAULT 0,
+                biggest_win INTEGER NOT NULL DEFAULT 0,
+                roulette_wins INTEGER NOT NULL DEFAULT 0,
+                slots_wins INTEGER NOT NULL DEFAULT 0,
+                blackjack_wins INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS economy_achievements (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                achievement_key TEXT NOT NULL,
+                unlocked_at INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id, achievement_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS economy_cooldowns (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                action_key TEXT NOT NULL,
+                last_used INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id, action_key)
+            );
+            """
+        )
+
+
+def ensure_full_economy_user(guild_id: int, user_id: int) -> None:
+    ensure_economy_user(guild_id, user_id)
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO economy_stats (
+                guild_id, user_id
+            )
+            VALUES (?, ?)
+            """,
+            (guild_id, user_id),
+        )
+
+
+def get_user_stats(guild_id: int, user_id: int) -> dict:
+    ensure_full_economy_user(guild_id, user_id)
+
+    with economy_lock, economy_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM economy_stats
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+    return dict(row)
+
+
+def add_xp(guild_id: int, user_id: int, amount: int) -> tuple[int, int]:
+    ensure_full_economy_user(guild_id, user_id)
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            """
+            SELECT xp, level
+            FROM economy_stats
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+        xp = row["xp"] + max(0, amount)
+        level = max(1, int((xp / 500) ** 0.5) + 1)
+
+        connection.execute(
+            """
+            UPDATE economy_stats
+            SET xp = ?, level = ?
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (xp, level, guild_id, user_id),
+        )
+        connection.commit()
+
+    return xp, level
+
+
+def update_game_stats(
+    guild_id: int,
+    user_id: int,
+    won: bool,
+    amount: int,
+    game: str,
+) -> None:
+    ensure_full_economy_user(guild_id, user_id)
+
+    game_column = {
+        "roulette": "roulette_wins",
+        "slots": "slots_wins",
+        "blackjack": "blackjack_wins",
+    }.get(game)
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+
+        if won and game_column:
+            connection.execute(
+                f"""
+                UPDATE economy_stats
+                SET games_won = games_won + 1,
+                    biggest_win = MAX(biggest_win, ?),
+                    {game_column} = {game_column} + 1
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (max(0, amount), guild_id, user_id),
+            )
+        elif won:
+            connection.execute(
+                """
+                UPDATE economy_stats
+                SET games_won = games_won + 1,
+                    biggest_win = MAX(biggest_win, ?)
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (max(0, amount), guild_id, user_id),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE economy_stats
+                SET games_lost = games_lost + 1
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            )
+
+        connection.commit()
+
+    add_xp(guild_id, user_id, 40 if won else 12)
+
+
+def inventory_quantity(
+    guild_id: int,
+    user_id: int,
+    item_key: str,
+) -> int:
+    with economy_lock, economy_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT quantity
+            FROM economy_inventory
+            WHERE guild_id = ? AND user_id = ? AND item_key = ?
+            """,
+            (guild_id, user_id, item_key),
+        ).fetchone()
+
+    return int(row["quantity"]) if row else 0
+
+
+def change_inventory(
+    guild_id: int,
+    user_id: int,
+    item_key: str,
+    amount: int,
+) -> tuple[bool, int]:
+    with economy_lock, economy_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            """
+            SELECT quantity
+            FROM economy_inventory
+            WHERE guild_id = ? AND user_id = ? AND item_key = ?
+            """,
+            (guild_id, user_id, item_key),
+        ).fetchone()
+
+        current = int(row["quantity"]) if row else 0
+        new_quantity = current + amount
+
+        if new_quantity < 0:
+            connection.rollback()
+            return False, current
+
+        connection.execute(
+            """
+            INSERT INTO economy_inventory (
+                guild_id, user_id, item_key, quantity
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id, user_id, item_key)
+            DO UPDATE SET quantity = excluded.quantity
+            """,
+            (guild_id, user_id, item_key, new_quantity),
+        )
+        connection.commit()
+
+    return True, new_quantity
+
+
+def get_inventory(guild_id: int, user_id: int) -> list[dict]:
+    with economy_lock, economy_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT item_key, quantity
+            FROM economy_inventory
+            WHERE guild_id = ? AND user_id = ? AND quantity > 0
+            ORDER BY quantity DESC, item_key
+            """,
+            (guild_id, user_id),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def check_cooldown(
+    guild_id: int,
+    user_id: int,
+    action_key: str,
+    duration: int,
+) -> tuple[bool, int]:
+    now = int(time.time())
+
+    with economy_lock, economy_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT last_used
+            FROM economy_cooldowns
+            WHERE guild_id = ? AND user_id = ? AND action_key = ?
+            """,
+            (guild_id, user_id, action_key),
+        ).fetchone()
+
+        if row and now - row["last_used"] < duration:
+            return False, duration - (now - row["last_used"])
+
+        connection.execute(
+            """
+            INSERT INTO economy_cooldowns (
+                guild_id, user_id, action_key, last_used
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id, user_id, action_key)
+            DO UPDATE SET last_used = excluded.last_used
+            """,
+            (guild_id, user_id, action_key, now),
+        )
+        connection.commit()
+
+    return True, 0
+
+
+def unlock_achievement(
+    guild_id: int,
+    user_id: int,
+    key: str,
+) -> bool:
+    if key not in ACHIEVEMENT_DEFINITIONS:
+        return False
+
+    with economy_lock, economy_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO economy_achievements (
+                guild_id, user_id, achievement_key, unlocked_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (guild_id, user_id, key, int(time.time())),
+        )
+        connection.commit()
+        return cursor.rowcount > 0
+
+
+def get_achievements(guild_id: int, user_id: int) -> list[str]:
+    with economy_lock, economy_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT achievement_key
+            FROM economy_achievements
+            WHERE guild_id = ? AND user_id = ?
+            ORDER BY unlocked_at
+            """,
+            (guild_id, user_id),
+        ).fetchall()
+
+    return [row["achievement_key"] for row in rows]
+
+
+def evaluate_achievements(guild_id: int, user_id: int) -> list[str]:
+    unlocked = []
+    account = get_economy_account(guild_id, user_id)
+    stats = get_user_stats(guild_id, user_id)
+    inventory = get_inventory(guild_id, user_id)
+
+    if stats["games_won"] >= 1 and unlock_achievement(guild_id, user_id, "first_win"):
+        unlocked.append("first_win")
+
+    if account["wallet"] + account["bank"] >= 1_000_000 and unlock_achievement(guild_id, user_id, "millionaire"):
+        unlocked.append("millionaire")
+
+    if account["daily_streak"] >= 7 and unlock_achievement(guild_id, user_id, "daily_7"):
+        unlocked.append("daily_7")
+
+    if stats["prestige"] >= 1 and unlock_achievement(guild_id, user_id, "prestige_1"):
+        unlocked.append("prestige_1")
+
+    if sum(item["quantity"] for item in inventory) >= 5 and unlock_achievement(guild_id, user_id, "collector"):
+        unlocked.append("collector")
+
+    return unlocked
+
+
+def roulette_colour(number: int) -> str:
+    if number == 0:
+        return "green"
+
+    red_numbers = {
+        1, 3, 5, 7, 9, 12, 14, 16, 18,
+        19, 21, 23, 25, 27, 30, 32, 34, 36,
+    }
+    return "red" if number in red_numbers else "black"
+
+
+def create_roulette_image(
+    player_name: str,
+    result: int,
+    colour: str,
+    bet_type: str,
+    selection: str,
+    bet: int,
+    payout: int,
+    balance: int,
+) -> io.BytesIO:
+    width, height = 1200, 700
+    image = Image.new("RGB", (width, height), (7, 7, 10))
+    draw = ImageDraw.Draw(image)
+
+    gold = (238, 186, 45)
+    light_gold = (255, 225, 130)
+    panel = (18, 18, 24)
+    felt = (13, 67, 47)
+    red = (175, 25, 32)
+    black = (20, 20, 25)
+    green = (20, 120, 65)
+
+    draw.rounded_rectangle(
+        (28, 28, width - 28, height - 28),
+        radius=38,
+        fill=panel,
+        outline=gold,
+        width=8,
+    )
+
+    title_font = get_slot_font(58, bold=True)
+    result_font = get_slot_font(130, bold=True)
+    header_font = get_slot_font(29, bold=True)
+    body_font = get_slot_font(25, bold=True)
+
+    draw.text(
+        (width // 2, 82),
+        "777 ROYALE ROULETTE",
+        font=title_font,
+        fill=light_gold,
+        anchor="mm",
+    )
+
+    wheel_box = (80, 145, 560, 620)
+    draw.ellipse(wheel_box, fill=(35, 28, 18), outline=gold, width=8)
+    draw.ellipse((130, 195, 510, 575), fill=felt, outline=gold, width=5)
+
+    result_colour = {
+        "red": red,
+        "black": black,
+        "green": green,
+    }[colour]
+
+    draw.ellipse(
+        (220, 285, 420, 485),
+        fill=result_colour,
+        outline=light_gold,
+        width=7,
+    )
+    draw.text(
+        (320, 385),
+        str(result),
+        font=result_font,
+        fill=(255, 255, 245),
+        anchor="mm",
+    )
+
+    draw.rounded_rectangle(
+        (640, 155, 1125, 600),
+        radius=30,
+        fill=(13, 13, 18),
+        outline=gold,
+        width=5,
+    )
+
+    lines = [
+        ("RESULT", f"{result} • {colour.upper()}"),
+        ("BET TYPE", bet_type.upper()),
+        ("SELECTION", selection.upper()),
+        ("BET", format_coins(bet)),
+        ("PAYOUT", format_coins(payout)),
+        ("BALANCE", format_coins(balance)),
+    ]
+
+    y = 210
+    for label, value in lines:
+        draw.text((685, y), label, font=header_font, fill=gold)
+        draw.text((685, y + 38), value, font=body_font, fill=(240, 240, 235))
+        y += 70
+
+    draw.text(
+        (width // 2, 660),
+        f"PLAYER: {player_name[:32]} • 777 • PLAY RESPONSIBLY",
+        font=body_font,
+        fill=(175, 175, 180),
+        anchor="mm",
+    )
+
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output
+
+
+async def execute_roulette(
+    interaction: discord.Interaction,
+    bet: int,
+    bet_type: str,
+    selection: str,
+) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Roulette can only be played inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    bet_type = bet_type.lower().strip()
+    selection = selection.lower().strip()
+
+    if bet < SLOTS_MIN_BET or bet > SLOTS_MAX_BET:
+        await interaction.response.send_message(
+            f"Bet between {format_coins(SLOTS_MIN_BET)} and {format_coins(SLOTS_MAX_BET)}.",
+            ephemeral=True,
+        )
+        return
+
+    valid = False
+    multiplier = 0
+
+    if bet_type == "colour" and selection in {"red", "black", "green"}:
+        valid = True
+        multiplier = 14 if selection == "green" else 2
+    elif bet_type == "parity" and selection in {"odd", "even"}:
+        valid = True
+        multiplier = 2
+    elif bet_type == "number":
+        try:
+            number_selection = int(selection)
+            valid = 0 <= number_selection <= 36
+            multiplier = 36
+        except ValueError:
+            valid = False
+
+    if not valid:
+        await interaction.response.send_message(
+            "Use `colour` with red/black/green, `parity` with odd/even, or `number` with 0–36.",
+            ephemeral=True,
+        )
+        return
+
+    account = await asyncio.to_thread(
+        get_economy_account,
+        interaction.guild.id,
+        interaction.user.id,
+    )
+
+    if account["wallet"] < bet:
+        await interaction.response.send_message(
+            "You do not have enough wallet coins.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+
+    charged, balance = await asyncio.to_thread(
+        change_wallet,
+        interaction.guild.id,
+        interaction.user.id,
+        -bet,
+        "roulette_bet",
+        f"type={bet_type};selection={selection}",
+    )
+
+    if not charged:
+        await interaction.followup.send(
+            "Your balance changed. Try again.",
+            ephemeral=True,
+        )
+        return
+
+    message = await interaction.edit_original_response(
+        embed=discord.Embed(
+            title="🎡 Roulette is spinning...",
+            description="`● ○ ○ ○ ○`",
+            colour=GOLD_COLOUR,
+        )
+    )
+
+    for frame in [
+        "`○ ● ○ ○ ○`",
+        "`○ ○ ● ○ ○`",
+        "`○ ○ ○ ● ○`",
+        "`○ ○ ○ ○ ●`",
+    ]:
+        await asyncio.sleep(0.55)
+        try:
+            await interaction.edit_original_response(
+                embed=discord.Embed(
+                    title="🎡 Roulette is spinning...",
+                    description=frame,
+                    colour=GOLD_COLOUR,
+                )
+            )
+        except discord.HTTPException:
+            pass
+
+    result = random.randint(0, 36)
+    colour = roulette_colour(result)
+
+    won = False
+    if bet_type == "colour":
+        won = selection == colour
+    elif bet_type == "parity":
+        won = result != 0 and (
+            (selection == "even" and result % 2 == 0)
+            or (selection == "odd" and result % 2 == 1)
+        )
+    else:
+        won = int(selection) == result
+
+    payout = bet * multiplier if won else 0
+
+    if payout:
+        _, balance = await asyncio.to_thread(
+            change_wallet,
+            interaction.guild.id,
+            interaction.user.id,
+            payout,
+            "roulette_payout",
+            f"result={result};colour={colour}",
+        )
+
+    profit = payout - bet
+    await asyncio.to_thread(
+        update_game_stats,
+        interaction.guild.id,
+        interaction.user.id,
+        won,
+        max(0, profit),
+        "roulette",
+    )
+
+    image = await asyncio.to_thread(
+        create_roulette_image,
+        interaction.user.display_name,
+        result,
+        colour,
+        bet_type,
+        selection,
+        bet,
+        payout,
+        balance,
+    )
+
+    filename = f"roulette_{interaction.user.id}_{int(time.time())}.png"
+    file = discord.File(image, filename=filename)
+
+    embed = discord.Embed(
+        title="🎡 777 Roulette Result",
+        description=(
+            f"## {'🎉 You won!' if won else '💸 You lost.'}\n\n"
+            f"The wheel landed on **{result} {colour.upper()}**."
+        ),
+        colour=GOLD_COLOUR,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_image(url=f"attachment://{filename}")
+    embed.add_field(name="Bet", value=format_coins(bet), inline=True)
+    embed.add_field(name="Payout", value=format_coins(payout), inline=True)
+    embed.add_field(name="Wallet", value=format_coins(balance), inline=True)
+
+    await interaction.edit_original_response(
+        embed=embed,
+        attachments=[file],
+    )
+
+
+def perform_economy_minigame(
+    guild_id: int,
+    user_id: int,
+    action: str,
+) -> tuple[bool, str, int, int]:
+    cooldown = MINIGAME_COOLDOWNS[action]
+    ready, remaining = check_cooldown(
+        guild_id, user_id, action, cooldown
+    )
+
+    if not ready:
+        return False, f"Cooldown: {format_cooldown(remaining)}", 0, 0
+
+    account = get_economy_account(guild_id, user_id)
+    reward = 0
+    description = ""
+
+    if action == "fish":
+        catches = [
+            ("a tiny fish", 40, 80),
+            ("a golden carp", 120, 240),
+            ("an old boot", 5, 15),
+            ("a rare shark", 300, 500),
+        ]
+        name, low, high = random.choice(catches)
+        reward = random.randint(low, high)
+        description = f"You caught **{name}**."
+
+    elif action == "mine":
+        finds = [
+            ("coal", 70, 130),
+            ("iron", 110, 190),
+            ("gold", 220, 400),
+            ("a diamond", 500, 800),
+        ]
+        name, low, high = random.choice(finds)
+        reward = random.randint(low, high)
+        description = f"You mined **{name}**."
+
+    elif action == "hunt":
+        finds = [
+            ("a rabbit", 90, 170),
+            ("a deer", 180, 330),
+            ("a legendary beast", 650, 950),
+        ]
+        name, low, high = random.choice(finds)
+        reward = random.randint(low, high)
+        description = f"You hunted **{name}**."
+
+    elif action == "crime":
+        if random.random() < 0.58:
+            reward = random.randint(250, 700)
+            description = "Your risky crime succeeded."
+        else:
+            loss = min(account["wallet"], random.randint(100, 450))
+            change_wallet(guild_id, user_id, -loss, "crime_failed")
+            return True, f"You were caught and fined {format_coins(loss)}.", -loss, account["wallet"] - loss
+
+    elif action == "heist":
+        if account["wallet"] < 1000:
+            return False, "You need at least 1,000 wallet coins to attempt a heist.", 0, account["wallet"]
+
+        if random.random() < 0.32:
+            reward = random.randint(1500, 5000)
+            description = "The heist succeeded."
+        else:
+            loss = min(account["wallet"], random.randint(500, 1500))
+            change_wallet(guild_id, user_id, -loss, "heist_failed")
+            return True, f"The heist failed and cost you {format_coins(loss)}.", -loss, account["wallet"] - loss
+
+    _, wallet = change_wallet(
+        guild_id,
+        user_id,
+        reward,
+        f"minigame_{action}",
+        description,
+    )
+    add_xp(guild_id, user_id, random.randint(15, 40))
+    return True, description, reward, wallet
+
+
+initialize_full_economy_tables()
+
 # =========================================================
 # SLASH COMMANDS
 # =========================================================
@@ -5219,6 +5992,532 @@ async def blackjack(
     await start_blackjack_game(
         interaction,
         bet,
+    )
+
+
+@bot.tree.command(
+    name="roulette",
+    description="Play animated 777 roulette.",
+)
+@app_commands.describe(
+    bet="Wallet coins to wager.",
+    bet_type="colour, parity, or number.",
+    selection="red/black/green, odd/even, or 0-36.",
+)
+async def roulette(
+    interaction: discord.Interaction,
+    bet: app_commands.Range[int, 1, 1_000_000_000],
+    bet_type: str,
+    selection: str,
+):
+    await execute_roulette(interaction, bet, bet_type, selection)
+
+
+@bot.tree.command(
+    name="shop",
+    description="Browse the 777 economy shop.",
+)
+async def shop(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🛒 777 Shop",
+        description="Use `/buy item amount` to purchase an item.",
+        colour=GOLD_COLOUR,
+    )
+
+    for key, item in FULL_ECONOMY_SHOP.items():
+        embed.add_field(
+            name=f"{item['emoji']} {item['name']} (`{key}`)",
+            value=f"{item['description']}\nPrice: **{format_coins(item['price'])}**",
+            inline=False,
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="buy",
+    description="Buy an item from the shop.",
+)
+async def buy(
+    interaction: discord.Interaction,
+    item: str,
+    amount: app_commands.Range[int, 1, 100] = 1,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Server only.", ephemeral=True)
+        return
+
+    item = item.lower().strip()
+    data = FULL_ECONOMY_SHOP.get(item)
+
+    if not data:
+        await interaction.response.send_message(
+            "Unknown item. Use `/shop` to see item keys.",
+            ephemeral=True,
+        )
+        return
+
+    total = data["price"] * amount
+    account = await asyncio.to_thread(
+        get_economy_account,
+        interaction.guild.id,
+        interaction.user.id,
+    )
+
+    if account["wallet"] < total:
+        await interaction.response.send_message(
+            f"You need {format_coins(total)}.",
+            ephemeral=True,
+        )
+        return
+
+    charged, wallet = await asyncio.to_thread(
+        change_wallet,
+        interaction.guild.id,
+        interaction.user.id,
+        -total,
+        "shop_purchase",
+        f"item={item};amount={amount}",
+    )
+
+    if not charged:
+        await interaction.response.send_message("Purchase failed.", ephemeral=True)
+        return
+
+    await asyncio.to_thread(
+        change_inventory,
+        interaction.guild.id,
+        interaction.user.id,
+        item,
+        amount,
+    )
+
+    await interaction.response.send_message(
+        f"{data['emoji']} Bought **{amount}× {data['name']}** for "
+        f"**{format_coins(total)}**.\nWallet: **{format_coins(wallet)}**"
+    )
+
+
+@bot.tree.command(
+    name="inventory",
+    description="View your or another member's inventory.",
+)
+async def inventory(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Server only.", ephemeral=True)
+        return
+
+    target = member or interaction.user
+    rows = await asyncio.to_thread(
+        get_inventory,
+        interaction.guild.id,
+        target.id,
+    )
+
+    if not rows:
+        await interaction.response.send_message(
+            f"{target.display_name}'s inventory is empty."
+        )
+        return
+
+    lines = []
+    for row in rows:
+        item = FULL_ECONOMY_SHOP.get(row["item_key"])
+        if item:
+            lines.append(
+                f"{item['emoji']} **{item['name']}** × `{row['quantity']}`"
+            )
+
+    embed = discord.Embed(
+        title=f"🎒 {target.display_name}'s Inventory",
+        description="\n".join(lines),
+        colour=GOLD_COLOUR,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="use",
+    description="Use a consumable inventory item.",
+)
+async def use_item(
+    interaction: discord.Interaction,
+    item: str,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Server only.", ephemeral=True)
+        return
+
+    item = item.lower().strip()
+    data = FULL_ECONOMY_SHOP.get(item)
+
+    if not data or not data["consumable"]:
+        await interaction.response.send_message(
+            "That item cannot be used.",
+            ephemeral=True,
+        )
+        return
+
+    success, _ = await asyncio.to_thread(
+        change_inventory,
+        interaction.guild.id,
+        interaction.user.id,
+        item,
+        -1,
+    )
+
+    if not success:
+        await interaction.response.send_message(
+            "You do not own that item.",
+            ephemeral=True,
+        )
+        return
+
+    if item == "golden_ticket":
+        reward = random.randint(500, 1500)
+        _, wallet = await asyncio.to_thread(
+            change_wallet,
+            interaction.guild.id,
+            interaction.user.id,
+            reward,
+            "golden_ticket",
+        )
+        message = f"🎟️ Your ticket paid **{format_coins(reward)}**. Wallet: {format_coins(wallet)}"
+
+    elif item == "xp_boost":
+        xp, level = await asyncio.to_thread(
+            add_xp,
+            interaction.guild.id,
+            interaction.user.id,
+            500,
+        )
+        message = f"⚡ Gained **500 XP**. You are level **{level}**."
+
+    elif item == "mystery_crate":
+        reward = random.randint(300, 3500)
+        _, wallet = await asyncio.to_thread(
+            change_wallet,
+            interaction.guild.id,
+            interaction.user.id,
+            reward,
+            "mystery_crate",
+        )
+        message = f"📦 The crate contained **{format_coins(reward)}**. Wallet: {format_coins(wallet)}"
+
+    else:
+        message = "Item used."
+
+    await interaction.response.send_message(message)
+
+
+@bot.tree.command(
+    name="sell",
+    description="Sell an inventory item back to the shop.",
+)
+async def sell(
+    interaction: discord.Interaction,
+    item: str,
+    amount: app_commands.Range[int, 1, 100] = 1,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Server only.", ephemeral=True)
+        return
+
+    item = item.lower().strip()
+    data = FULL_ECONOMY_SHOP.get(item)
+
+    if not data:
+        await interaction.response.send_message("Unknown item.", ephemeral=True)
+        return
+
+    success, _ = await asyncio.to_thread(
+        change_inventory,
+        interaction.guild.id,
+        interaction.user.id,
+        item,
+        -amount,
+    )
+
+    if not success:
+        await interaction.response.send_message(
+            "You do not own enough of that item.",
+            ephemeral=True,
+        )
+        return
+
+    payout = data["sell"] * amount
+    _, wallet = await asyncio.to_thread(
+        change_wallet,
+        interaction.guild.id,
+        interaction.user.id,
+        payout,
+        "shop_sale",
+        f"item={item};amount={amount}",
+    )
+
+    await interaction.response.send_message(
+        f"Sold **{amount}× {data['name']}** for "
+        f"**{format_coins(payout)}**.\nWallet: **{format_coins(wallet)}**"
+    )
+
+
+async def run_minigame_command(
+    interaction: discord.Interaction,
+    action: str,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Server only.", ephemeral=True)
+        return
+
+    success, description, reward, wallet = await asyncio.to_thread(
+        perform_economy_minigame,
+        interaction.guild.id,
+        interaction.user.id,
+        action,
+    )
+
+    if not success:
+        await interaction.response.send_message(description, ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"🎮 {action.title()} Result",
+        description=description,
+        colour=GOLD_COLOUR,
+    )
+
+    embed.add_field(
+        name="Result",
+        value=(
+            f"+{format_coins(reward)}"
+            if reward >= 0
+            else f"-{format_coins(abs(reward))}"
+        ),
+        inline=True,
+    )
+    embed.add_field(name="Wallet", value=format_coins(wallet), inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="fish", description="Go fishing for coins.")
+async def fish(interaction: discord.Interaction):
+    await run_minigame_command(interaction, "fish")
+
+
+@bot.tree.command(name="mine", description="Mine resources for coins.")
+async def mine(interaction: discord.Interaction):
+    await run_minigame_command(interaction, "mine")
+
+
+@bot.tree.command(name="hunt", description="Go hunting for rewards.")
+async def hunt(interaction: discord.Interaction):
+    await run_minigame_command(interaction, "hunt")
+
+
+@bot.tree.command(name="crime", description="Attempt a risky crime.")
+async def crime(interaction: discord.Interaction):
+    await run_minigame_command(interaction, "crime")
+
+
+@bot.tree.command(name="heist", description="Attempt a high-risk heist.")
+async def heist(interaction: discord.Interaction):
+    await run_minigame_command(interaction, "heist")
+
+
+@bot.tree.command(
+    name="profile",
+    description="View an economy profile.",
+)
+async def profile(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message("Server only.", ephemeral=True)
+        return
+
+    target = member or interaction.user
+    account = await asyncio.to_thread(
+        get_economy_account,
+        interaction.guild.id,
+        target.id,
+    )
+    stats = await asyncio.to_thread(
+        get_user_stats,
+        interaction.guild.id,
+        target.id,
+    )
+    achievements = await asyncio.to_thread(
+        get_achievements,
+        interaction.guild.id,
+        target.id,
+    )
+
+    embed = discord.Embed(
+        title=f"👤 {target.display_name}'s Economy Profile",
+        colour=GOLD_COLOUR,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(
+        name="Net Worth",
+        value=format_coins(account["wallet"] + account["bank"]),
+        inline=True,
+    )
+    embed.add_field(name="Level", value=str(stats["level"]), inline=True)
+    embed.add_field(name="XP", value=f"{stats['xp']:,}", inline=True)
+    embed.add_field(name="Prestige", value=str(stats["prestige"]), inline=True)
+    embed.add_field(name="Wins", value=str(stats["games_won"]), inline=True)
+    embed.add_field(name="Losses", value=str(stats["games_lost"]), inline=True)
+    embed.add_field(
+        name="Biggest Win",
+        value=format_coins(stats["biggest_win"]),
+        inline=True,
+    )
+    embed.add_field(
+        name="Achievements",
+        value=str(len(achievements)),
+        inline=True,
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="stats",
+    description="View detailed casino statistics.",
+)
+async def stats(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Server only.", ephemeral=True)
+        return
+
+    stats_data = await asyncio.to_thread(
+        get_user_stats,
+        interaction.guild.id,
+        interaction.user.id,
+    )
+
+    embed = discord.Embed(
+        title="📈 777 Casino Statistics",
+        colour=GOLD_COLOUR,
+    )
+    embed.add_field(name="Total Wins", value=str(stats_data["games_won"]), inline=True)
+    embed.add_field(name="Total Losses", value=str(stats_data["games_lost"]), inline=True)
+    embed.add_field(name="Slots Wins", value=str(stats_data["slots_wins"]), inline=True)
+    embed.add_field(name="Blackjack Wins", value=str(stats_data["blackjack_wins"]), inline=True)
+    embed.add_field(name="Roulette Wins", value=str(stats_data["roulette_wins"]), inline=True)
+    embed.add_field(name="Biggest Win", value=format_coins(stats_data["biggest_win"]), inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="achievements",
+    description="View your unlocked achievements.",
+)
+async def achievements(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Server only.", ephemeral=True)
+        return
+
+    newly_unlocked = await asyncio.to_thread(
+        evaluate_achievements,
+        interaction.guild.id,
+        interaction.user.id,
+    )
+    keys = await asyncio.to_thread(
+        get_achievements,
+        interaction.guild.id,
+        interaction.user.id,
+    )
+
+    if not keys:
+        await interaction.response.send_message(
+            "No achievements unlocked yet.",
+            ephemeral=True,
+        )
+        return
+
+    lines = []
+    for key in keys:
+        name, description = ACHIEVEMENT_DEFINITIONS[key]
+        lines.append(f"🏆 **{name}** — {description}")
+
+    embed = discord.Embed(
+        title="🏆 Achievements",
+        description="\n".join(lines),
+        colour=GOLD_COLOUR,
+    )
+
+    if newly_unlocked:
+        embed.set_footer(text=f"Newly unlocked: {len(newly_unlocked)}")
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="prestige",
+    description="Reset your economy for a permanent prestige rank.",
+)
+async def prestige(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Server only.", ephemeral=True)
+        return
+
+    account = await asyncio.to_thread(
+        get_economy_account,
+        interaction.guild.id,
+        interaction.user.id,
+    )
+
+    required = 10_000_000
+    net_worth = account["wallet"] + account["bank"]
+
+    if net_worth < required:
+        await interaction.response.send_message(
+            f"You need a net worth of **{format_coins(required)}** to prestige.",
+            ephemeral=True,
+        )
+        return
+
+    with economy_lock, economy_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            UPDATE economy_users
+            SET wallet = ?, bank = 0
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (
+                ECONOMY_STARTING_BALANCE,
+                interaction.guild.id,
+                interaction.user.id,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE economy_stats
+            SET prestige = prestige + 1
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (interaction.guild.id, interaction.user.id),
+        )
+        connection.commit()
+
+    await asyncio.to_thread(
+        unlock_achievement,
+        interaction.guild.id,
+        interaction.user.id,
+        "prestige_1",
+    )
+
+    await interaction.response.send_message(
+        "✨ **Prestige complete!** Your balance was reset and your prestige rank increased."
     )
 
 
